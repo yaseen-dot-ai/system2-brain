@@ -1,0 +1,6 @@
+virtual/
+__pycache__/
+.pytest_cache/
+.env
+
+*weights/
