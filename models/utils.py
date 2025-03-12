@@ -1,62 +1,72 @@
-from PIL import Image
+from PIL import Image, ImageDraw
 import numpy as np
 import torch
-import torch.nn as nn
-from models.ui_attention_predictor import Platform
 import matplotlib.pyplot as plt
+
 import io
 import base64
 import traceback
 import json
+
 from openai import OpenAI
+from langchain_anthropic import ChatAnthropic
 
-cos = nn.CosineSimilarity(dim=0, eps=1e-8)
+from pydantic import BaseModel
+from typing import Optional, List
 
-def preprocess_image(image: Image.Image) -> torch.Tensor:
-    """
-    Preprocess the input image for model inference
-    """
-    # Add your image preprocessing logic here
-    # Example:
-    # - Resize
-    # - Normalize
-    # - Convert to tensor
-    pass
+import os
 
 
-def postprocess_output(model_output: torch.Tensor) -> list:
-    """
-    Convert model output to the desired format
-    """
-    # Add your output processing logic here
-    pass
-
-
-def validate_inputs(age: int, platform: str, task: str, tech_saviness: int) -> bool:
-    """
-    Validate all input parameters
-    """
-    try:
-        # Add validation logic
-        assert isinstance(age, int) and 0 <= age <= 120
-        assert isinstance(platform, Platform)  # platform should already be a Platform enum
-        assert isinstance(tech_saviness, int) and 1 <= tech_saviness <= 10
-        return True
-    except:
-        return False
+def get_cropped_icon(image, element, ratio=0.04):
+    image_width, image_height = image.size
+    x, y = element["position"]
+        
+    # Convert normalized coordinates to pixel coordinates
+    pixel_x = int(x * image_width)
+    pixel_y = int(y * image_height)
+    
+    box_size = int(ratio * image_width)
+    
+    # Calculate initial crop coordinates
+    x1 = pixel_x - box_size // 2
+    y1 = pixel_y - box_size // 2
+    
+    # Adjust coordinates if they go beyond image bounds while maintaining square shape
+    if x1 < 0:
+        x1 = 0
+        x2 = box_size
+    elif x1 + box_size > image_width:
+        x2 = image_width
+        x1 = image_width - box_size
+    else:
+        x2 = x1 + box_size
+        
+    if y1 < 0:
+        y1 = 0
+        y2 = box_size
+    elif y1 + box_size > image_height:
+        y2 = image_height
+        y1 = image_height - box_size
+    else:
+        y2 = y1 + box_size
+    
+    # Convert PIL Image to numpy array, crop, and convert back to PIL Image
+    image_array = np.array(image)
+    cropped_array = image_array[y1:y2, x1:x2, :]  # Include all channels
+    cropped_icon = Image.fromarray(cropped_array).convert('RGB')
+    return cropped_icon
     
 
-def evaluate_cropped_icon(model, processor, embed_model, cropped_icon, task_description, threshold=0.4):
-    # cropped_icon = cropped_icon.convert('RGB')
+def evaluate_cropped_icon(cropped_icon, task_description, cross_encoder, tokenizer):
     # cropped_icon.resize((64, 64), resample=Image.Resampling.LANCZOS)
-    
     caption = chat_vllm(cropped_icon, "What are the UI elements in this image and what are they used for ? Answer in one sentence.")
     
-    embeddings = embed_model.encode([caption, task_description], convert_to_tensor=True)
-    print(f"caption: {caption}, task_description: {task_description}")
-    similarity = cos(embeddings[0], embeddings[1])
-    print(f"similarity: {similarity.item()}")
-    return similarity.item() > threshold
+    cross_encoder.eval()
+    with torch.no_grad():
+        inputs = tokenizer([task_description, caption], padding=True, truncation=True, return_tensors='pt', max_length=512)
+        score = cross_encoder(**inputs, return_dict=True).logits.view(-1, ).float()[0]
+    
+    return score
 
 
 def get_color_for_timestep(timestep, max_timesteps):
@@ -92,6 +102,7 @@ def get_color_for_timestep(timestep, max_timesteps):
     b = int(color1[2] + (color2[2] - color1[2]) * progress)
     
     return (r, g, b, int(255 * 0.8))  # Keep alpha at 0.8
+
 
 def draw_attention(attention_point, ui_image, timestep_count, total_timesteps=100) -> tuple[Image.Image, tuple[int, int, int, int]]:
     from PIL import Image, ImageDraw
@@ -133,223 +144,6 @@ def draw_attention(attention_point, ui_image, timestep_count, total_timesteps=10
     return ui_image, color
 
 
-def create_spatial_grid(elements):
-    # Sort elements by y-coordinate first (rows)
-    sorted_by_y = sorted(elements, key=lambda x: x["position"][1])
-    
-    # Group elements into rows based on y-coordinate proximity
-    rows = []
-    current_row = []
-    y_threshold = 0.05  # Adjust based on your UI layout
-    
-    for element in sorted_by_y:
-        if not current_row or abs(element["position"][1] - current_row[0]["position"][1]) < y_threshold:
-            current_row.append(element)
-        else:
-            current_row.sort(key=lambda x: x["position"][0])
-            rows.append(current_row)
-            current_row = [element]
-    
-    if current_row:
-        current_row.sort(key=lambda x: x["position"][0])
-        rows.append(current_row)
-    
-    return rows
-
-
-def z_scan_pattern(elements_ref, last_element, debug):
-    if not last_element:
-        # Start from top-left
-        if debug:
-            print("Starting from top-left element: 0, 0")
-        return min(elements_ref, key=lambda x: (x["position"][1], x["position"][0]))
-    
-    spatial_grid = create_spatial_grid(elements_ref)
-    current_row_idx = None
-    current_col_idx = None
-    
-    # Find current position in grid
-    for i, row in enumerate(spatial_grid):
-        for j, element in enumerate(row):
-            if element["element_id"] == last_element["element_id"]:
-                current_row_idx = i
-                current_col_idx = j
-                if debug:
-                    print(f"found last element in grid: {current_row_idx}, {current_col_idx}")
-                break
-        if current_row_idx is not None:
-            break
-    
-    if current_row_idx is None:
-        if debug:
-            print("current_row_idx is None")
-        return None
-    
-    if debug:
-        print(f"moving in z-pattern: {current_row_idx}, {current_col_idx} ->", end=" ")
-    # Z-pattern movement
-    if current_row_idx % 2 == 0:  # Moving right
-        if current_col_idx < len(spatial_grid[current_row_idx]) - 1:
-            if debug:
-                print(f"{current_row_idx}, {current_col_idx + 1}")
-            return spatial_grid[current_row_idx][current_col_idx + 1]
-        elif current_row_idx < len(spatial_grid) - 1:
-            # Move to next row, starting from right
-            if debug:
-                print(f"{current_row_idx + 1}, {len(spatial_grid[current_row_idx + 1]) - 1}")
-            return spatial_grid[current_row_idx + 1][-1]
-    else:  # Moving left
-        if current_col_idx > 0:
-            if debug:
-                print(f"{current_row_idx}, {current_col_idx - 1}")
-            return spatial_grid[current_row_idx][current_col_idx - 1]
-        elif current_row_idx < len(spatial_grid) - 1:
-            # Move to next row, starting from left
-            if debug:
-                print(f"{current_row_idx + 1}, 0")
-            return spatial_grid[current_row_idx + 1][0]
-    
-    return None
-
-
-def find_current_position(last_element, spatial_grid):
-    """Helper function to find element position in grid"""
-    for i, row in enumerate(spatial_grid):
-        for j, element in enumerate(row):
-            if element["element_id"] == last_element["element_id"]:
-                return i, j
-    return None, None
-
-
-def f_scan_pattern(elements_ref, last_element, debug):
-    import random
-    
-    if not last_element:
-        if debug:
-            print("Starting from top-left element: 0, 0")
-        return min(elements_ref, key=lambda x: (x["position"][1], x["position"][0]))
-    
-    spatial_grid = create_spatial_grid(elements_ref)
-    current_row_idx, current_col_idx = find_current_position(last_element, spatial_grid)
-    
-    if current_row_idx is None:
-        if debug:
-            print("Element not found in grid")
-        return None    
-    
-    if debug:
-        print(f"Moving in f-pattern: {current_row_idx}, {current_col_idx} ->", end=" ")
-        
-    # If not in first column, chance to return to first columns
-    if current_col_idx > 0:
-        cols_in_row = len(spatial_grid[current_row_idx])
-        jump_probability = 2/(cols_in_row + 3)        
-        if random.random() < jump_probability:
-            target_col = random.randint(0, 1)
-            if target_col < cols_in_row:
-                if debug:
-                    print(f"{current_row_idx}, {target_col}")
-                return spatial_grid[current_row_idx][target_col]
-    
-    # If in first two columns of lower rows, chance to jump to top rows
-    if current_row_idx > 1 and current_col_idx < 2:
-        jump_probability = 2/(len(spatial_grid) + 4)
-        
-        if random.random() < jump_probability:
-            target_row = random.randint(0, 1)
-            if current_col_idx < len(spatial_grid[target_row]):
-                if debug:
-                    print(f"{target_row}, {current_col_idx}")
-                return spatial_grid[target_row][current_col_idx]
-    
-    # Default sequential movement
-    if current_col_idx < len(spatial_grid[current_row_idx]) - 1:
-        if debug:
-            print(f"{current_row_idx}, {current_col_idx + 1}")
-        return spatial_grid[current_row_idx][current_col_idx + 1]
-    elif current_row_idx < len(spatial_grid) - 1:
-        if debug:
-            print(f"{current_row_idx + 1}, 0")
-        return spatial_grid[current_row_idx + 1][0]
-    
-    if debug:
-        print("No valid moves remaining")
-    return None
-
-
-def layered_scan_pattern(elements_ref, last_element, debug, layer_size=2):
-    if not last_element:
-        # Start from top-left
-        return min(elements_ref, key=lambda x: (x["position"][1], x["position"][0]))
-    
-    spatial_grid = create_spatial_grid(elements_ref)
-    current_row_idx = None
-    current_col_idx = None
-    
-    # Find current position in grid
-    for i, row in enumerate(spatial_grid):
-        for j, element in enumerate(row):
-            if element["element_id"] == last_element["element_id"]:
-                current_row_idx = i
-                current_col_idx = j
-                if debug:
-                    print(f"found last element in grid: {current_row_idx}, {current_col_idx}")
-                break
-        if current_row_idx is not None:
-            break
-    
-    if current_row_idx is None:
-        if debug:
-            print("current_row_idx is None")
-        return None
-    
-    if debug:
-        print(f"Moving in layered pattern: {current_row_idx}, {current_col_idx} ->", end=" ")
-    
-    # Determine which layer we're in
-    current_layer = current_row_idx // layer_size
-    layer_start = current_layer * layer_size
-    layer_end = min(layer_start + layer_size, len(spatial_grid))
-    
-    # Scan within current layer
-    if current_col_idx < len(spatial_grid[current_row_idx]) - 1:
-        if debug:
-            print(f"{current_row_idx}, {current_col_idx + 1}")
-        return spatial_grid[current_row_idx][current_col_idx + 1]
-    elif current_row_idx < layer_end - 1:
-        if debug:
-            print(f"{current_row_idx + 1}, 0")
-        return spatial_grid[current_row_idx + 1][0]
-    elif layer_end < len(spatial_grid):
-        if debug:
-            print(f"{layer_end}, 0")
-        return spatial_grid[layer_end][0]
-    
-    if debug:
-        print("Reached end of grid!")
-    return None
-
-def spotted_pattern(elements_ref, last_element, debug):
-    visual_elements = sorted(elements_ref, key=lambda x: x["component_scores"]["visual"], reverse=True)
-    if not last_element:
-        return visual_elements[0]
-    for i, element in enumerate(visual_elements):
-        if element["element_id"] == last_element["element_id"] and i < len(visual_elements) - 1:
-            return visual_elements[i+1]
-    return None
-
-def find_next_element_scan(elements_ref, pattern, last_element, debug=False):
-    if pattern == "Spotted Pattern":
-        return spotted_pattern(elements_ref, last_element, debug)
-    elif pattern == "Z-Pattern":
-        return z_scan_pattern(elements_ref, last_element, debug)
-    elif pattern == "F-Pattern":
-        return f_scan_pattern(elements_ref, last_element, debug)
-    elif pattern == "Layered Pattern":
-        return layered_scan_pattern(elements_ref, last_element, debug)
-    
-    return None
-
 def display_image(image: Image.Image, jup=True):
     if jup:
         image.show()
@@ -361,6 +155,7 @@ def display_image(image: Image.Image, jup=True):
     plt.axis('off')
     plt.show(block=True)  # This will block until the window is closed
     plt.close()  # Explicitly close the figure
+
 
 def chat_vllm(image: Image.Image, prompt: str, base_url="https://uitars.wisit.io", api_key: str="dummy-key", model_name: str="bytedance-research/UI-TARS-2B-SFT") -> str:
     # Encode image to base64
@@ -412,3 +207,234 @@ def chat_vllm(image: Image.Image, prompt: str, base_url="https://uitars.wisit.io
     except Exception as e:
         print(f"Error in chat_vllm, traceback: {traceback.format_exc()}")
         return ""
+
+
+async def chat_anthropic(prompt: str, image: Optional[Image.Image]=None, history_msgs: List[dict[str, str]] = [{"role": "system", "content": "You are a helpful assistant."}], model_name: str="claude-3-5-sonnet-20240620", output_schema: Optional[BaseModel]=None) -> str:
+    model = ChatAnthropic(model=model_name, temperature=0, max_tokens=8000, api_key=os.getenv("ANTHROPIC_API_KEY"))
+    messages = history_msgs + [{"role": "user", "content": prompt}]
+    if image:
+        # Encode image to base64
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        buffered = io.BytesIO()
+        image.save(buffered, format="JPEG")
+        image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        messages = history_msgs + [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64," + image_base64}
+                    }
+                ]
+            }
+        ]
+    if output_schema:
+        response = await model.with_structured_output(output_schema).ainvoke(messages)
+    else:
+        response = await model.ainvoke(messages)
+    return response.content
+
+
+def attention_decay(index, total_elements):
+    """
+    Implements a more realistic attention decay function.
+    - Sharp initial drop (first few elements get significantly more attention)
+    - Followed by a more gradual decline
+    - Maintains a minimum attention level (people don't completely ignore elements)
+    """
+    # Parameters to tune the attention curve
+    initial_drop_rate = 2.5  # Controls how sharp the initial attention drop is
+    base_attention = 0.2    # Minimum attention level (never goes to zero)
+    
+    # Normalized position (0 to 1)
+    normalized_pos = index / total_elements
+    
+    # Modified exponential decay with baseline
+    score = (1 - base_attention) * np.exp(-initial_drop_rate * normalized_pos) + base_attention
+    return score
+
+
+def create_spatial_grid(elements):
+    # Sort elements by y-coordinate first (rows)
+    sorted_by_y = sorted(elements, key=lambda x: x["position"][1])
+    
+    # Group elements into rows based on y-coordinate proximity
+    rows = []
+    current_row = []
+    y_threshold = 0.05  # Adjust based on your UI layout
+    
+    for element in sorted_by_y:
+        if not current_row or abs(element["position"][1] - current_row[0]["position"][1]) < y_threshold:
+            current_row.append(element)
+        else:
+            current_row.sort(key=lambda x: x["position"][0])
+            rows.append(current_row)
+            current_row = [element]
+    
+    if current_row:
+        current_row.sort(key=lambda x: x["position"][0])
+        rows.append(current_row)
+    
+    return rows
+
+
+def f_scan_pattern_scores(elements_ref, last_element, debug):
+    spatial_grid = create_spatial_grid(elements_ref)
+    scored_elements = []
+    
+    # Check if last_element exists in the grid
+    last_element_found = False
+    if last_element:
+        for row in spatial_grid:
+            for element in row:
+                if element["element_id"] == last_element["element_id"]:
+                    last_element_found = True
+                    break
+            if last_element_found:
+                break
+    
+    # If last_element was found, use layered scanning from that point
+    if last_element_found:
+        # First collect elements row by row (layered pattern)
+        for i in range(len(spatial_grid)):
+            row = spatial_grid[i]
+            for j in range(len(row)):
+                scored_elements.append(row[j])
+                
+        # Remove elements up to and including last_element
+        for index, element in enumerate(scored_elements):
+            if element["element_id"] == last_element["element_id"]:
+                scored_elements = scored_elements[index + 1:]
+                break
+                
+        # Apply simple attention decay to remaining elements
+        total_elements = len(scored_elements)
+        for index, element in enumerate(scored_elements):
+            score = attention_decay(index, total_elements)
+            scored_elements[index] = (element, score)
+            
+    # If starting from beginning or last_element not found, use F-pattern
+    else:
+        # Collect and score elements in F-pattern
+        for i in range(len(spatial_grid)):
+            row = spatial_grid[i]
+            for j, element in enumerate(row):
+                base_score = attention_decay(len(scored_elements), len(elements_ref))
+                
+                # Apply F-pattern boost only for initial scan
+                if i < 2:  # First two rows get full scan attention
+                    boost = 1.0
+                elif j < 2:  # Left side gets attention after first two rows
+                    boost = 0.8
+                else:  # Other elements get base attention
+                    boost = 0.5
+                    
+                scored_elements.append((element, min(1.0, base_score * boost)))
+    
+    return scored_elements
+
+
+def z_scan_pattern_scores(elements_ref, last_element, debug):
+    spatial_grid = create_spatial_grid(elements_ref)
+    scored_elements = []
+    
+    # Traverse the spatial grid in Z-pattern
+    for i in range(len(spatial_grid)):
+        row = spatial_grid[i]
+        if i % 2 == 0:  # Moving right
+            for j in range(len(row)):
+                scored_elements.append(row[j])
+        else:  # Moving left
+            for j in range(len(row) - 1, -1, -1):
+                scored_elements.append(row[j])
+    
+    # Remove elements up to and including last_element
+    if last_element:
+        for index, element in enumerate(scored_elements):
+            if element["element_id"] == last_element["element_id"]:
+                scored_elements = scored_elements[index + 1:]
+                break
+    
+    # Score the elements using the attention decay function
+    total_elements = len(scored_elements)
+    for index, element in enumerate(scored_elements):
+        score = attention_decay(index, total_elements)
+        scored_elements[index] = (element, score)
+    
+    return scored_elements
+
+
+def layered_scan_pattern_scores(elements_ref, last_element, debug, layer_size=2):
+    spatial_grid = create_spatial_grid(elements_ref)
+    scored_elements = []
+    
+    # Traverse the spatial grid in layered pattern
+    for layer_start in range(0, len(spatial_grid), layer_size):
+        layer_end = min(layer_start + layer_size, len(spatial_grid))
+        
+        # Process each row within the current layer
+        for i in range(layer_start, layer_end):
+            row = spatial_grid[i]
+            for j in range(len(row)):
+                scored_elements.append(row[j])
+    
+    # Remove elements up to and including last_element
+    if last_element:
+        for index, element in enumerate(scored_elements):
+            if element["element_id"] == last_element["element_id"]:
+                scored_elements = scored_elements[index + 1:]
+                break
+    
+    # Score the elements using the attention decay function
+    total_elements = len(scored_elements)
+    for index, element in enumerate(scored_elements):
+        score = attention_decay(index, total_elements)
+        scored_elements[index] = (element, score)
+    
+    return scored_elements
+
+
+def spotted_pattern_scores(elements_ref, last_element, debug):
+    # Sort elements by their visual score in descending order
+    visual_elements = sorted(elements_ref, key=lambda x: x["visual_score"], reverse=True)
+    scored_elements = []
+    
+    # Remove elements up to and including last_element
+    if last_element:
+        for index, element in enumerate(visual_elements):
+            if element["element_id"] == last_element["element_id"]:
+                visual_elements = visual_elements[index + 1:]
+                break
+    
+    # Score remaining elements using attention decay
+    total_elements = len(visual_elements)
+    for index, element in enumerate(visual_elements):
+        score = attention_decay(index, total_elements)
+        scored_elements.append((element, score))
+    
+    return scored_elements
+
+
+def find_scanning_pattern_scores(elements_ref, pattern, last_element, debug=False):
+    if pattern == "Spotted Pattern":
+        return spotted_pattern_scores(elements_ref, last_element, debug)
+    elif pattern == "Z-Pattern":
+        return z_scan_pattern_scores(elements_ref, last_element, debug)
+    elif pattern == "F-Pattern":
+        return f_scan_pattern_scores(elements_ref, last_element, debug)
+    elif pattern == "Layered Pattern":
+        return layered_scan_pattern_scores(elements_ref, last_element, debug)
+    
+    return None
+
+
+def draw_bounding_box(image, element):
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(element["bounds"], outline="red", width=2)
+    return image
