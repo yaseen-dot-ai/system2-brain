@@ -1,10 +1,12 @@
 import base64
 import requests
 import json
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
+import matplotlib.pyplot as plt
+import numpy as np
 
-url = "http://localhost:8000/s2"
+url = "https://5591-14-143-179-90.ngrok-free.app/s2"
 
 image = Image.open("dashboard.png")
 buffered = BytesIO()
@@ -162,6 +164,58 @@ headers = {
 response = requests.request("POST", url, headers=headers, data=payload)
 
 if response.status_code == 200:
-    print(response)
+    result = response.json()
+    print(result)
+    
+    # Create a copy of the image for drawing
+    image_with_box = image.copy()
+    draw = ImageDraw.Draw(image_with_box)
+    
+    # Get the selected element
+    selected_element = result["selected_element"]
+    action = result["action"]
+    
+    # Draw bounding box
+    box_coords = [
+        selected_element["x"],
+        selected_element["y"],
+        selected_element["x"] + selected_element["width"],
+        selected_element["y"] + selected_element["height"]
+    ]
+    draw.rectangle(box_coords, outline="red", width=2)
+    
+    # Add action label
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+    except:
+        font = ImageFont.load_default()
+    
+    # Draw label background
+    label_text = f"{action.upper()}: {selected_element['text'] or selected_element['type']}"
+    text_bbox = draw.textbbox((0, 0), label_text, font=font)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+    
+    # Position label above the bounding box
+    label_x = selected_element["x"]
+    label_y = max(0, selected_element["y"] - text_height - 5)
+    
+    # Draw label background
+    draw.rectangle(
+        [label_x, label_y, label_x + text_width, label_y + text_height],
+        fill="red"
+    )
+    
+    # Draw label text
+    draw.text((label_x, label_y), label_text, fill="white", font=font)
+    
+    # Convert PIL Image to numpy array for matplotlib
+    img_array = np.array(image_with_box)
+    
+    # Display with matplotlib
+    plt.figure(figsize=(15, 10))
+    plt.imshow(img_array)
+    plt.axis('off')  # Hide axes
+    plt.show()
 else:
     print(response.json())

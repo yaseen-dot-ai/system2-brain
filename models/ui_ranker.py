@@ -501,7 +501,7 @@ class UIRanker:
         return
 
 
-    async def rank_elements(self, screenshot_image, previous_screenshot_image, elements, task, context, last_element):
+    async def rank_elements(self, screenshot_image, previous_screenshot_image, original_elements, task, context, original_last_element):
         # assert (screenshot_image.width, screenshot_image.height) == (1920, 1080), f"Screenshot must be 1920x1080, got {screenshot_image.width}x{screenshot_image.height}"
         
         elements = [
@@ -522,23 +522,24 @@ class UIRanker:
                     (item.y + (item.y + item.height)) / (2 * screenshot_image.height)
                 )
             }
-            for i, item in enumerate(elements)
+            for i, item in enumerate(original_elements)
         ]
         
-        if last_element:
+        last_element = None
+        if original_last_element:
             last_element = {
-                "element_id": f"{last_element.type}-{last_element.text}-{last_element.x}-{last_element.y}-{last_element.width}-{last_element.height}",
-                "type": last_element.type,
-                "text": last_element.text,
+                "element_id": f"{original_last_element.type}-{original_last_element.text}-{original_last_element.x}-{original_last_element.y}-{original_last_element.width}-{original_last_element.height}",
+                "type": original_last_element.type,
+                "text": original_last_element.text,
                 "bounds": {
-                    "x1": last_element.x / screenshot_image.width,
-                    "x2": (last_element.x + last_element.width) / screenshot_image.width,
-                    "y1": last_element.y / screenshot_image.height,
-                    "y2": (last_element.y + last_element.height) / screenshot_image.height
+                    "x1": original_last_element.x / screenshot_image.width,
+                    "x2": (original_last_element.x + original_last_element.width) / screenshot_image.width,
+                    "y1": original_last_element.y / screenshot_image.height,
+                    "y2": (original_last_element.y + original_last_element.height) / screenshot_image.height
                 },
                 "position": (
-                    (last_element.x + (last_element.x + last_element.width)) / (2 * screenshot_image.width),
-                    (last_element.y + (last_element.y + last_element.height)) / (2 * screenshot_image.height)
+                    (original_last_element.x + (original_last_element.x + original_last_element.width)) / (2 * screenshot_image.width),
+                    (original_last_element.y + (original_last_element.y + original_last_element.height)) / (2 * screenshot_image.height)
                 )
             }
         
@@ -590,4 +591,7 @@ class UIRanker:
             element["final_score"] = final_score
             element["final_reasoning"] = reasoning.strip()
         
-        return sorted(elements, key=lambda x: x["final_score"], reverse=True)
+        # Find element with highest score
+        max_element = max(elements, key=lambda x: x["final_score"])
+        max_index = elements.index(max_element)
+        return max_element, max_index, max_element["final_reasoning"]

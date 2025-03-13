@@ -21,6 +21,7 @@ app = FastAPI(
 
 ui_ranker = UIRanker()
 async def get_next_element(screenshot_image, previous_screenshot_image, task, context, scratchpad, elements, prev_action, ui_ranker=ui_ranker):
+    
     if scratchpad:
         scratchpad_str = '\n------------\n'.join([f'{action["content"]}' for i, action in enumerate(scratchpad)])
         prompt = f"""You are a {context["age"]} years old {context["domain_familiarity"]} level {context["domain"]}, with {context["tech_savviness"]} tech savviness, navigating a UI to complete a specific task. 
@@ -67,8 +68,7 @@ Should we continue from this point or backtrack to a previous state?"""
     last_action = prev_action.get("action", None)
     last_element = prev_action.get("bounding", None)
     
-    ranked_elements = await ui_ranker.rank_elements(screenshot_image, previous_screenshot_image, elements, task, context, last_element)
-    output_element = ranked_elements[0]
+    output_element, max_index, reasoning = await ui_ranker.rank_elements(screenshot_image, previous_screenshot_image, elements, task, context, last_element)
     
     if last_action == "hover":
         if last_element["element_id"] == output_element["element_id"]:
@@ -83,12 +83,10 @@ Should we continue from this point or backtrack to a previous state?"""
     else:
         action = "click"
         
-    
-    reasoning = output_element["final_reasoning"]
     print("reasoning: ", reasoning)
     
     print("output of ui_ranker.rank_elements:\n", json.dumps(output_element, indent=4))
-    return output_element, action, reasoning
+    return elements[max_index], action, reasoning
 
 
 class Element(BaseModel):
