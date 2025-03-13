@@ -57,7 +57,7 @@ def get_cropped_icon(image, element, ratio=0.30):
     cropped_icon = Image.fromarray(cropped_array).convert('RGB')
     return cropped_icon
 
-def process_single_image(image, model_processor, prompt=None):
+def process_single_image(image, caption_model, prompt=None):
     """Process a single image through the model to generate caption/description.
     
     Args:
@@ -65,7 +65,7 @@ def process_single_image(image, model_processor, prompt=None):
         model_processor: Dict containing model and processor
         prompt: Optional prompt text to guide generation
     """
-    model, processor = model_processor['model'], model_processor['processor']
+    model, processor = caption_model['model'], caption_model['processor']
     
     # Set default prompt based on model type
     if not prompt:
@@ -114,14 +114,15 @@ def process_single_image(image, model_processor, prompt=None):
     generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
     return generated_text.strip()
 
-def evaluate_cropped_icon(cropped_icon, task_description, cross_encoder, tokenizer):
+
+def evaluate_cropped_icon(cropped_icon, task_description, cross_encoder, tokenizer, caption_model):
     cropped_icon.resize((256, 256), resample=Image.Resampling.LANCZOS)
-    caption = process_single_image(cropped_icon, "What is the purpose of the highlighted UI element in this image ? Answer in one sentence.")
+    caption = process_single_image(cropped_icon, caption_model, "What is the purpose of the highlighted UI element in this image ? Answer in one sentence.")
     
     cross_encoder.eval()
     with torch.no_grad():
         inputs = tokenizer([task_description, caption], padding=True, truncation=True, return_tensors='pt', max_length=512)
-        score = cross_encoder(**inputs, return_dict=True).logits.view(-1, ).float()[0]
+        score = cross_encoder(**inputs, return_dict=True).logits.view(-1, ).float()[0].item()
     
     return score
 
@@ -293,8 +294,8 @@ async def chat_anthropic(prompt: str, image: Optional[Image.Image]=None, history
         ]
     if output_schema:
         response = await model.with_structured_output(output_schema).ainvoke(messages)
-    else:
-        response = await model.ainvoke(messages)
+        return response
+    response = await model.ainvoke(messages)
     return response.content
 
 
@@ -374,7 +375,7 @@ def f_scan_pattern_scores(elements_ref, last_element, debug):
         total_elements = len(scored_elements)
         for index, element in enumerate(scored_elements):
             score = attention_decay(index, total_elements)
-            scored_elements[index] = (element, score)
+            scored_elements[index] = (element["element_id"], score)
             
     # If starting from beginning or last_element not found, use F-pattern
     else:
@@ -392,7 +393,7 @@ def f_scan_pattern_scores(elements_ref, last_element, debug):
                 else:  # Other elements get base attention
                     boost = 0.5
                     
-                scored_elements.append((element, min(1.0, base_score * boost)))
+                scored_elements.append((element["element_id"], min(1.0, base_score * boost)))
     
     return scored_elements
 
@@ -422,7 +423,7 @@ def z_scan_pattern_scores(elements_ref, last_element, debug):
     total_elements = len(scored_elements)
     for index, element in enumerate(scored_elements):
         score = attention_decay(index, total_elements)
-        scored_elements[index] = (element, score)
+        scored_elements[index] = (element["element_id"], score)
     
     return scored_elements
 
@@ -452,7 +453,7 @@ def layered_scan_pattern_scores(elements_ref, last_element, debug, layer_size=2)
     total_elements = len(scored_elements)
     for index, element in enumerate(scored_elements):
         score = attention_decay(index, total_elements)
-        scored_elements[index] = (element, score)
+        scored_elements[index] = (element["element_id"], score)
     
     return scored_elements
 
@@ -473,7 +474,7 @@ def spotted_pattern_scores(elements_ref, last_element, debug):
     total_elements = len(visual_elements)
     for index, element in enumerate(visual_elements):
         score = attention_decay(index, total_elements)
-        scored_elements.append((element, score))
+        scored_elements.append((element["element_id"], score))
     
     return scored_elements
 
@@ -492,6 +493,20 @@ def find_scanning_pattern_scores(elements_ref, pattern, last_element, debug=Fals
 
 
 def draw_bounding_box(image, element):
-    draw = ImageDraw.Draw(image)
-    draw.rectangle(element["bounds"], outline="red", width=2)
-    return image
+    """Draw a red bounding box around the element on a copy of the image"""
+    img_copy = image.copy()
+    draw = ImageDraw.Draw(img_copy)
+    
+    bounds = element["bounds"]
+    width, height = image.size
+    
+    # Convert relative coordinates to absolute pixels and create coordinate sequence
+    box_coords = [
+        bounds["x1"] * width,  # x1
+        bounds["y1"] * height, # y1
+        bounds["x2"] * width,  # x2
+        bounds["y2"] * height  # y2
+    ]
+    
+    draw.rectangle(box_coords, outline="red", width=2)
+    return img_copy

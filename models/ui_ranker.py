@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from models.eye_pattern import EyePatternPredictor
+from models.op_utils.omniparser import Omniparser
 from models.utils import get_cropped_icon, evaluate_cropped_icon, chat_anthropic, find_scanning_pattern_scores, draw_bounding_box
 
 load_dotenv()
@@ -18,8 +19,17 @@ class UIRanker:
     def __init__(self):
         self.eye_pattern_predictor = EyePatternPredictor()
 
-        self.tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-reranker-small')
-        self.model = AutoModelForSequenceClassification.from_pretrained('BAAI/bge-reranker-small')
+        self.tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-reranker-base')
+        self.model = AutoModelForSequenceClassification.from_pretrained('BAAI/bge-reranker-base')
+        
+        op_config = {
+            'som_model_path': os.path.join(BASE_PATH, os.getenv('SOM_MODEL_PATH')),
+            'caption_model_name': os.getenv('CAPTION_MODEL_NAME', 'florence2'),
+            'caption_model_path': os.path.join(BASE_PATH, os.getenv('CAPTION_MODEL_PATH')),
+            'BOX_TRESHOLD': float(os.getenv('BOX_THRESHOLD', 0.05)),
+        }
+        
+        self.omniparser = Omniparser(op_config)
         
 
     # def get_elements_from_image(self, screenshot_image):
@@ -318,7 +328,7 @@ class UIRanker:
 
 
     def calculate_discoverability_scores(self, screenshot_image, previous_image, elements, context, last_element):
-        age = context["age"]
+        age = int(context["age"])
         tech_savviness = context["tech_savviness"]
         scanning_pattern = self.eye_pattern_predictor.predict(age)
         
@@ -341,7 +351,8 @@ class UIRanker:
             delta_scores = [(1.0, "Initial view")] * len(elements)
         
         # Get pattern scores
-        pattern_scores = find_scanning_pattern_scores(elements, scanning_pattern, last_element)
+        pattern_scores_dict = {k: v for k, v in find_scanning_pattern_scores(elements, scanning_pattern, last_element)}
+        pattern_scores = [pattern_scores_dict[element["element_id"]] for element in elements]
         
         # Combine scores with heavy weight on delta
         for i, (element, visual_score) in enumerate(zip(elements, visual_scores)):
@@ -387,15 +398,6 @@ class UIRanker:
         - Engineering: Tolerance specification, material property inputs
         """
         from enum import Enum
-
-        class ElementType(str, Enum):
-            GENERIC = "generic"
-            DOMAIN_SPECIFIC = "domain_specific"
-
-        class UnderstandingLevel(str, Enum):
-            LOW = "low"      # Beginner-friendly elements
-            MEDIUM = "medium"  # Intermediate-level elements
-            HIGH = "high"    # Expert-level elements
     
         # First determine if element is generic or domain-specific
         prompt = """You are an intelligent UI designer. Your task is to determine if the highlighted UI element is:
@@ -404,6 +406,10 @@ class UIRanker:
         DOMAIN_SPECIFIC: Elements specific to a field/industry (like fiscal quarter input, medical diagnosis codes)
         
         Look at the highlighted element and classify it."""
+        
+        class ElementType(str, Enum):
+            GENERIC = "generic"
+            DOMAIN_SPECIFIC = "domain_specific"
         
         class GenericOrDomain(BaseModel):
             element_type: ElementType = Field(
@@ -418,43 +424,48 @@ class UIRanker:
             return
         
         # For domain-specific elements
-        prompt = f"""You are an expert in {context['domain_knowledge']} domain. 
+        prompt = f"""You are an expert in {context['domain']} domain. 
         Determine how complex the domain concept behind this UI element is.
         
         Examples:
-        LOW: Basic industry terms, common metrics
-        MEDIUM: Standard industry calculations, specialized inputs
-        HIGH: Complex domain concepts, expert-level metrics"""
+        BEGINNER: Basic industry terms, common metrics
+        INTERMEDIATE: Standard industry calculations, specialized inputs
+        EXPERT: Complex domain concepts, expert-level metrics"""
+        
+        class UnderstandingLevel(str, Enum):
+            BEGINNER = "beginner"      # Beginner-friendly elements
+            INTERMEDIATE = "intermediate"  # Intermediate-level elements
+            EXPERT = "expert"    # Expert-level elements
         
         class ExpertiseLevel(BaseModel):
             required_level: UnderstandingLevel = Field(
                 description=f"""
-                LOW: Basic domain concepts (simple industry terms)
-                MEDIUM: Standard domain operations (common calculations)
-                HIGH: Complex domain concepts (expert-level metrics)
+                BEGINNER: Basic domain concepts (simple industry terms)
+                INTERMEDIATE: Standard domain operations (common calculations)
+                EXPERT: Complex domain concepts (expert-level metrics)
                 """
             )
         
         expertise_response = await chat_anthropic(prompt, highlighted_image, output_schema=ExpertiseLevel)
         required_level = expertise_response.required_level
-        user_level = context["domain_familiarity"]
+        user_level = context["domain_familiarity"].lower()
         
         # Same scoring matrix as before
         scoring_matrix = {
-            "high": {
-                "high": 1.0,    # Expert with complex concept
-                "medium": 1.0,  # Expert with standard concept
-                "low": 1.0      # Expert with basic concept
+            "expert": {
+                "expert": 1.0,    # Expert with complex concept
+                "intermediate": 1.0,  # Expert with standard concept
+                "beginner": 1.0      # Expert with basic concept
             },
-            "medium": {
-                "high": 0.7,    # Intermediate with complex concept
-                "medium": 1.0,  # Intermediate with standard concept
-                "low": 1.0      # Intermediate with basic concept
+            "intermediate": {
+                "expert": 0.7,    # Intermediate with complex concept
+                "intermediate": 1.0,  # Intermediate with standard concept
+                "beginner": 1.0      # Intermediate with basic concept
             },
-            "low": {
-                "high": 0.2,    # Beginner with complex concept
-                "medium": 0.4,  # Beginner with standard concept
-                "low": 0.7      # Beginner with basic concept
+            "beginner": {
+                "expert": 0.2,    # Beginner with complex concept
+                "intermediate": 0.4,  # Beginner with standard concept
+                "beginner": 0.7      # Beginner with basic concept
             }
         }
         
@@ -464,7 +475,7 @@ class UIRanker:
         - Required expertise: {required_level}
         - User expertise: {user_level}
         - Score: {score:.2f} based on expertise gap
-        - Domain: {context['domain_knowledge']}
+        - Domain: {context['domain']}
         """
         
         element["understandability_score"] = score
@@ -475,7 +486,7 @@ class UIRanker:
     def calculate_semantic_relevance_scores(self, image, elements, task):
         for element in elements:
             cropped_icon = get_cropped_icon(image, element)
-            score = evaluate_cropped_icon(cropped_icon, task, self.model, self.tokenizer)
+            score = evaluate_cropped_icon(cropped_icon, task, self.model, self.tokenizer, self.omniparser.caption_model_processor)
             
             reasoning = f"""
             Semantic Relevance: {score:.2f}
@@ -490,57 +501,66 @@ class UIRanker:
         return
 
 
-    def rank_elements(self, screenshot_image, previous_screenshot_image, elements, task, context, last_element):
-        assert (screenshot_image.width, screenshot_image.height) == (1920, 1080), "Screenshot must be 1920x1080"
+    async def rank_elements(self, screenshot_image, previous_screenshot_image, elements, task, context, last_element):
+        # assert (screenshot_image.width, screenshot_image.height) == (1920, 1080), f"Screenshot must be 1920x1080, got {screenshot_image.width}x{screenshot_image.height}"
         
         elements = [
             {
-                "type": item["type"],
-                "text": item["text"],
+                "element_id": f"{item.type}-{item.text}-{item.x}-{item.y}-{item.width}-{item.height}",
+                "type": item.type,
+                "text": item.text,
                 "bounds": {
-                    "x1": item["x"] / screenshot_image.width,
-                    "x2": (item["x"] + item["width"]) / screenshot_image.width,
-                    "y1": item["y"] / screenshot_image.height,
-                    "y2": (item["y"] + item["height"]) / screenshot_image.height
+                    "x1": item.x / screenshot_image.width,
+                    "x2": (item.x + item.width) / screenshot_image.width,
+                    "y1": item.y / screenshot_image.height,
+                    "y2": (item.y + item.height) / screenshot_image.height
                 },
                 "position": (
                     # Find center by averaging left and right edges (normalized to 0-1)
-                    (item["x"] + (item["x"] + item["width"])) / (2 * screenshot_image.width),
+                    (item.x + (item.x + item.width)) / (2 * screenshot_image.width),
                     # Find center by averaging top and bottom edges (normalized to 0-1)
-                    (item["y"] + (item["y"] + item["height"])) / (2 * screenshot_image.height)
+                    (item.y + (item.y + item.height)) / (2 * screenshot_image.height)
                 )
             }
             for i, item in enumerate(elements)
         ]
         
-        last_element = {
-            "type": last_element["type"],
-            "text": last_element["text"],
-            "bounds": {
-                "x1": last_element["x"] / screenshot_image.width,
-                "x2": (last_element["x"] + last_element["width"]) / screenshot_image.width,
-                "y1": last_element["y"] / screenshot_image.height,
-                "y2": (last_element["y"] + last_element["height"]) / screenshot_image.height
-            },
-            "position": (
-                (last_element["x"] + (last_element["x"] + last_element["width"])) / (2 * screenshot_image.width),
-                (last_element["y"] + (last_element["y"] + last_element["height"])) / (2 * screenshot_image.height)
-            )
-        }
+        if last_element:
+            last_element = {
+                "element_id": f"{last_element.type}-{last_element.text}-{last_element.x}-{last_element.y}-{last_element.width}-{last_element.height}",
+                "type": last_element.type,
+                "text": last_element.text,
+                "bounds": {
+                    "x1": last_element.x / screenshot_image.width,
+                    "x2": (last_element.x + last_element.width) / screenshot_image.width,
+                    "y1": last_element.y / screenshot_image.height,
+                    "y2": (last_element.y + last_element.height) / screenshot_image.height
+                },
+                "position": (
+                    (last_element.x + (last_element.x + last_element.width)) / (2 * screenshot_image.width),
+                    (last_element.y + (last_element.y + last_element.height)) / (2 * screenshot_image.height)
+                )
+            }
+        
+        print("Parsed elements...")
         
         # Discoverability
         self.calculate_discoverability_scores(screenshot_image, previous_screenshot_image, elements, context, last_element)
         
+        print("Calculated discoverability scores...")
+        
         # Understandability
-        asyncio.run(
-            asyncio.gather(*[
-                self.calculate_understandability_score(element, draw_bounding_box(screenshot_image, element), context) 
-                for element in elements
-            ])
-        )
+        await asyncio.gather(*[
+            self.calculate_understandability_score(element, draw_bounding_box(screenshot_image, element), context) 
+            for element in elements
+        ])
+        
+        print("Calculated understandability scores...")
         
         # Semantic relevance
         self.calculate_semantic_relevance_scores(screenshot_image, elements, task)
+        
+        print("Calculated semantic relevance scores...")
         
         # Weighted average of the scores
         for i, element in enumerate(elements):
@@ -571,52 +591,3 @@ class UIRanker:
             element["final_reasoning"] = reasoning.strip()
         
         return sorted(elements, key=lambda x: x["final_score"], reverse=True)
-
-
-def get_next_element(screenshot_image, previous_screenshot_image, task, context, scratchpad, elements, prev_action):
-    if scratchpad:
-        scratchpad_str = '\n------------\n'.join([f'{action["content"]}' for i, action in enumerate(scratchpad)])
-        prompt = f"""You are a {context["age"]} years old {context["domain_familiarity"]} level {context["domain"]}, with {context["tech_savviness"]} tech savviness, navigating a UI to complete a specific task. 
-
-TASK OBJECTIVE:
-```
-{task}
-```
-
-INTERACTION HISTORY:
-This is your report of the actions you have performed:
-```
-{scratchpad_str}
-```
-
-CURRENT SITUATION:
-Looking at the current screenshot and considering the interaction history:
-1. Does the current page still lead toward the task objective?
-2. Have we moved away from the logical path to complete the task?
-3. Would a typical {context["domain_familiarity"]} {context["domain"]} with {context["tech_savviness"]} tech savviness realize they need to backtrack?
-
-DECISION NEEDED:
-Should we continue from this point or backtrack to a previous state?"""
-        
-        class BacktrackDecision(BaseModel):
-            '''Evaluation of whether to continue or backtrack based on task progress'''
-            backtrack: bool = Field(
-                description="True if you should return to a previous state (wrong path/dead end), False if current path still leads to objective"
-            )
-            confidence: float = Field(
-                description="Confidence in this decision (0.0-1.0). Consider your expertise and clarity of the situation",
-                ge=0.0,
-                le=1.0
-            )
-            reasoning: str = Field(
-                description="Brief explanation of why this decision makes sense for your current situation"
-            )
-            
-        response = asyncio.run(chat_anthropic(prompt, screenshot_image, output_schema=BacktrackDecision))
-    
-        if response.backtrack and response.confidence > 0.5:
-            return "backtrack", "", response.reasoning
-    
-    ui_ranker = UIRanker()    
-    last_element = prev_action.get("bounding", None)
-    return ui_ranker.rank_elements(screenshot_image, previous_screenshot_image, elements, task, context, last_element)

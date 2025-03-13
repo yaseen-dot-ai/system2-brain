@@ -2,11 +2,14 @@ import base64
 import requests
 import json
 from PIL import Image
+from io import BytesIO
 
 url = "http://localhost:8000/s2"
 
 image = Image.open("dashboard.png")
-image_base64 = base64.b64encode(image.tobytes()).decode('utf-8')
+buffered = BytesIO()
+image.save(buffered, format="PNG")
+image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 payload = json.dumps({
   "task": "add a widget to the dashboard",
@@ -32,7 +35,7 @@ payload = json.dumps({
       "selector": "html > body:nth-child(2) > div:nth-child(1) > div > div:nth-child(1) > div:nth-child(1) > button > span:nth-child(1) > svg"
     }
   },
-  "bboxes": [
+  "elements": [
     {
       "selector": "html > body:nth-child(2) > div:nth-child(1) > div > div:nth-child(1) > div:nth-child(1) > button > span:nth-child(1) > svg",
       "text": "element element element element element icon",
@@ -128,7 +131,7 @@ payload = json.dumps({
       "text": "Go Back",
       "type": "div",
       "width": 24,
-      "height": 51.71875,
+      "height": 52,
       "x": 108,
       "y": 24
     },
@@ -158,4 +161,7 @@ headers = {
 
 response = requests.request("POST", url, headers=headers, data=payload)
 
-print(response.text)
+if response.status_code == 200:
+    print(response)
+else:
+    print(response.json())

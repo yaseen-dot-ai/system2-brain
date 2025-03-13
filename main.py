@@ -1,18 +1,94 @@
+import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import base64
 from io import BytesIO
+import asyncio
 from PIL import Image
 import re
+import traceback
 
-from models.ui_ranker import get_next_element
+from models.ui_ranker import UIRanker
+from models.utils import chat_anthropic
 
 app = FastAPI(
     title="System 2 API",
     description="API for simulating System 2 reasoning in web interaction decisions",
     version="0.1.0"
 )
+
+
+ui_ranker = UIRanker()
+async def get_next_element(screenshot_image, previous_screenshot_image, task, context, scratchpad, elements, prev_action, ui_ranker=ui_ranker):
+    if scratchpad:
+        scratchpad_str = '\n------------\n'.join([f'{action["content"]}' for i, action in enumerate(scratchpad)])
+        prompt = f"""You are a {context["age"]} years old {context["domain_familiarity"]} level {context["domain"]}, with {context["tech_savviness"]} tech savviness, navigating a UI to complete a specific task. 
+
+TASK OBJECTIVE:
+```
+{task}
+```
+
+INTERACTION HISTORY:
+This is your report of the actions you have performed:
+```
+{scratchpad_str}
+```
+
+CURRENT SITUATION:
+Looking at the current screenshot and considering the interaction history:
+1. Does the current page still lead toward the task objective?
+2. Have we moved away from the logical path to complete the task?
+3. Would a typical {context["domain_familiarity"]} {context["domain"]} with {context["tech_savviness"]} tech savviness realize they need to backtrack?
+
+DECISION NEEDED:
+Should we continue from this point or backtrack to a previous state?"""
+        
+        class BacktrackDecision(BaseModel):
+            '''Evaluation of whether to continue or backtrack based on task progress'''
+            backtrack: bool = Field(
+                description="True if you should return to a previous state (wrong path/dead end), False if current path still leads to objective"
+            )
+            confidence: float = Field(
+                description="Confidence in this decision (0.0-1.0). Consider your expertise and clarity of the situation",
+                ge=0.0,
+                le=1.0
+            )
+            reasoning: str = Field(
+                description="Brief explanation of why this decision makes sense for your current situation"
+            )
+            
+        response = await chat_anthropic(prompt, screenshot_image, output_schema=BacktrackDecision)
+    
+        if response.backtrack and response.confidence > 0.5:
+            return None, "backtrack", response.reasoning
+    
+    last_action = prev_action.get("action", None)
+    last_element = prev_action.get("bounding", None)
+    
+    ranked_elements = await ui_ranker.rank_elements(screenshot_image, previous_screenshot_image, elements, task, context, last_element)
+    output_element = ranked_elements[0]
+    
+    if last_action == "hover":
+        if last_element["element_id"] == output_element["element_id"]:
+            action = "click"
+        else:
+            action = "hover"
+    elif last_action == "click":
+        if last_element["element_id"] == output_element["element_id"] and output_element["type"] == "textbox":
+            action = "type"
+        else:
+            action = "click"
+    else:
+        action = "click"
+        
+    
+    reasoning = output_element["final_reasoning"]
+    print("reasoning: ", reasoning)
+    
+    print("output of ui_ranker.rank_elements:\n", json.dumps(output_element, indent=4))
+    return output_element, action, reasoning
 
 
 class Element(BaseModel):
@@ -97,7 +173,7 @@ async def system2(request: System2Request):
         # Get the screenshots as PIL Image objects
         current_image, previous_image = request.get_images()
         
-        element, action, reasoning = get_next_element(current_image, request.task, request.context, request.scratchpad, request.elements, request.prev_action)
+        element, action, reasoning = await get_next_element(current_image, previous_image, request.task, request.context, request.scratchpad, request.elements, request.prev_action)
         
         # For now, return a placeholder response
         return System2Response(
@@ -106,10 +182,14 @@ async def system2(request: System2Request):
             reasoning=reasoning
         )
         
-    except HTTPException:
+    except HTTPException as http_exc:
         raise  # Re-raise HTTP exceptions (like 400s) directly
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Capture the traceback
+        tb = traceback.format_exc()
+        # Log or print the traceback if needed
+        print(tb)  # You can also use logging instead of print
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}\nTraceback:\n{tb}")
 
 
 if __name__ == "__main__":
