@@ -15,29 +15,45 @@ app = FastAPI(
 )
 
 
-class System2Request(BaseModel):
-    """Base model for System 2 requests"""
-    scratchpad: Optional[str] = Field(None, description="The scratchpad for the user to write down their thoughts")
-    task: str  # the task that the user is trying to complete
-    screenshot: str = Field(..., description="Base64 encoded screenshot or image URL")
-    context: Dict[str, Any]
+class Element(BaseModel):
+    x: int
+    y: int
+    width: int
+    height: int
+    text: str
+    type: str
+    selector: str
+    
 
-    def get_image(self) -> Image.Image:
-        """Convert the screenshot to a PIL Image object"""
-        try:
+class System2Request(BaseModel):
+    task: str
+    previous_screenshot: str | None = None
+    screenshot: str
+    context: Dict[str, Any]
+    scratchpad: List[Dict[str, str]] = []
+    elements: List[Element] = []
+    prev_action: Dict[str, str | Element] = {}
+    
+    def get_images(self) -> tuple[Image.Image, Image.Image | None]:
+        """Convert both screenshots to PIL Image objects
+        Returns:
+            tuple: (current_image, previous_image)
+            where previous_image may be None if no previous screenshot provided
+        """
+        def parse_single_image(img_data: str) -> Image.Image:
             # Check if it's a URL
-            if self.screenshot.startswith(('http://', 'https://')):
+            if img_data.startswith(('http://', 'https://')):
                 import requests
-                response = requests.get(self.screenshot)
+                response = requests.get(img_data)
                 response.raise_for_status()
                 return Image.open(BytesIO(response.content))
             
             # Check if it's a base64 string
-            if self.screenshot.startswith('data:image'):
+            if img_data.startswith('data:image'):
                 # Remove data URL prefix if present
-                base64_data = re.sub('^data:image/.+;base64,', '', self.screenshot)
+                base64_data = re.sub('^data:image/.+;base64,', '', img_data)
             else:
-                base64_data = self.screenshot
+                base64_data = img_data
 
             try:
                 # Decode base64 string
@@ -48,46 +64,48 @@ class System2Request(BaseModel):
                     status_code=400,
                     detail="Invalid base64 image data"
                 )
+
+        try:
+            # Always parse current screenshot
+            current_image = parse_single_image(self.screenshot)
+            
+            # Parse previous screenshot if provided
+            previous_image = None
+            if self.previous_screenshot:
+                previous_image = parse_single_image(self.previous_screenshot)
+            
+            return current_image, previous_image
             
         except HTTPException:
             raise  # Re-raise HTTP exceptions
         except Exception as e:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to process screenshot: {str(e)}"
+                detail=f"Failed to process screenshots: {str(e)}"
             )
 
 
 class System2Response(BaseModel):
-    """Base model for System 2 responses"""
-    selected_element: Dict[str, Any]
+    selected_element: Element
+    action: str
     reasoning: str
-    confidence: float
 
 
 @app.post("/s2", response_model=System2Response)
 async def system2(request: System2Request):
-    """
-    System 2 endpoint for determining web interactions.
-    
-    Args:
-        request: System2Request containing screenshot and context
-        
-    Returns:
-        System2Response containing the selected element, reasoning, and confidence
-    """
     try:
-        # Get the screenshot as a PIL Image
-        screenshot_image = request.get_image()
+        # Get the screenshots as PIL Image objects
+        current_image, previous_image = request.get_images()
         
-        element_id, element_type, confidence, reasoning = get_next_element(screenshot_image, request.task, request.context, request.scratchpad)
+        element, action, reasoning = get_next_element(current_image, request.task, request.context, request.scratchpad, request.elements, request.prev_action)
         
         # For now, return a placeholder response
         return System2Response(
-            selected_element={"id": element_id, "type": element_type},
-            reasoning=reasoning,
-            confidence=confidence
+            selected_element=element,
+            action=action,
+            reasoning=reasoning
         )
+        
     except HTTPException:
         raise  # Re-raise HTTP exceptions (like 400s) directly
     except Exception as e:

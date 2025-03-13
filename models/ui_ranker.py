@@ -45,6 +45,7 @@ class UIRanker:
     #         for item in parsed_content_list
     #     ]
     #     return elements_data
+    
 
     def get_contrast_scores(self, image, elements, age):
         """Calculate contrast scores for UI elements based on their brightness relative to surroundings.
@@ -165,79 +166,207 @@ class UIRanker:
         return scores
 
 
-    def calculate_visual_scores(self, contrast_scores, size_scores, tech_savviness):
+    def get_interactivity_scores(self, elements):
         """
-        Calculate visual scores as weighted average of contrast and size scores.
+        Calculate interactivity scores for UI elements based on their type and appearance.
+        Higher scores for elements that appear more interactive/clickable.
+        """
+        interactivity_weights = {
+            # High interactivity (1.0)
+            "button": 1.0,
+            "link": 1.0,
+            "input": 1.0,
+            "select": 1.0,
+            "checkbox": 1.0,
+            "radio": 1.0,
+            
+            # Medium interactivity (0.7)
+            "dropdown": 0.7,
+            "menu": 0.7,
+            "tab": 0.7,
+            "icon": 0.7,
+            
+            # Low interactivity (0.4)
+            "text": 0.4,
+            "label": 0.4,
+            "image": 0.4,
+            
+            # Default for unknown types
+            "default": 0.4
+        }
+        
+        scores = []
+        for element in elements:
+            element_type = element["type"].lower()
+            
+            # Check for interactive keywords in text
+            has_interactive_text = False
+            if "text" in element:
+                text = element["text"].lower()
+                interactive_keywords = ["click", "tap", "select", "choose", "submit", "login", "sign in", "register"]
+                has_interactive_text = any(keyword in text for keyword in interactive_keywords)
+            
+            # Get base score from type
+            base_score = interactivity_weights.get(element_type, interactivity_weights["default"])
+            
+            # Boost score if text suggests interactivity
+            if has_interactive_text:
+                base_score = min(1.0, base_score + 0.2)
+            
+            scores.append(base_score)
+        
+        return scores
+
+
+    def calculate_visual_scores(self, contrast_scores, size_scores, interactivity_scores, tech_savviness):
+        """
+        Calculate visual scores as weighted average of contrast, size, and interactivity scores.
         Weights vary based on tech savviness:
-        - LOW: Size ideality matters more because they need properly-sized, standard UI elements
-        - MEDIUM: Balanced consideration of both factors
-        - HIGH: Can adapt to varying element sizes, so contrast becomes more important for quick scanning
+        - LOW: Size ideality and interactivity matter more (need obvious interactive elements)
+        - MEDIUM: Balanced consideration
+        - HIGH: Can recognize subtle interactive elements, so contrast becomes more important
         """
         if tech_savviness == "LOW":
-            size_weight = 0.7     # Less tech-savvy users rely more on standard, properly-sized elements
-            contrast_weight = 0.3  # Still need good contrast but size ideality is more crucial
+            size_weight = 0.4      # Need properly-sized elements
+            contrast_weight = 0.2   # Basic visibility
+            interact_weight = 0.4   # Need obvious interactive elements
         elif tech_savviness == "MEDIUM":
-            size_weight = 0.5     # Equal consideration
-            contrast_weight = 0.5
+            size_weight = 0.3      # Balanced
+            contrast_weight = 0.4
+            interact_weight = 0.3
         else:  # HIGH
-            size_weight = 0.4     # Can adapt to different sizes as long as they're visible
-            contrast_weight = 0.6  # Contrast helps in quick scanning and recognition
+            size_weight = 0.2      # Can adapt to different sizes
+            contrast_weight = 0.5   # Quick scanning
+            interact_weight = 0.3   # Can recognize subtle interactive elements
         
         return [
-            (contrast_weight * c + size_weight * s)
-            for c, s in zip(contrast_scores, size_scores)
+            (contrast_weight * c + size_weight * s + interact_weight * i)
+            for c, s, i in zip(contrast_scores, size_scores, interactivity_scores)
         ]
 
 
-    class ScoredElement(BaseModel):
-        """Structure to hold both score and reasoning"""
-        score: float
-        reasoning: str
+    def calculate_delta_scores(self, current_image, previous_image, elements):
+        """
+        Hybrid approach combining direct pixel differences with structural analysis
+        for better change detection.
+        """
+        import cv2
+        import numpy as np
+        
+        curr_array = np.array(current_image.convert('RGB'))
+        prev_array = np.array(previous_image.convert('RGB'))
+        
+        # Convert to grayscale
+        curr_gray = cv2.cvtColor(curr_array, cv2.COLOR_RGB2GRAY)
+        prev_gray = cv2.cvtColor(prev_array, cv2.COLOR_RGB2GRAY)
+        
+        height, width = curr_gray.shape
+        delta_scores = []
+        
+        for element in elements:
+            # Get element bounds
+            x1 = int(element["bounds"]["x1"] * width)
+            x2 = int(element["bounds"]["x2"] * width)
+            y1 = int(element["bounds"]["y1"] * height)
+            y2 = int(element["bounds"]["y2"] * height)
+            
+            curr_region = curr_gray[y1:y2, x1:x2]
+            prev_region = prev_gray[y1:y2, x1:x2]
+            
+            try:
+                # 1. Direct pixel differences for large changes
+                diff = cv2.absdiff(curr_region, prev_region)
+                mse = np.mean(diff ** 2)
+                pixel_change = min(1.0, mse / 10000)
+                
+                # 2. Structural changes for subtle differences
+                # Apply Gaussian blur with smaller kernel for finer detail
+                blurred_curr = cv2.GaussianBlur(curr_region, (3, 3), 0)
+                blurred_prev = cv2.GaussianBlur(prev_region, (3, 3), 0)
+                structural_diff = cv2.absdiff(blurred_curr, blurred_prev)
+                structural_change = np.mean(structural_diff > 20) # Lower threshold for subtle changes
+                
+                # Combine scores with emphasis on larger changes
+                change_score = max(
+                    pixel_change,  # Catches obvious changes
+                    structural_change * 0.8  # Catches subtle changes but weighted less
+                )
+                
+            except Exception:
+                change_score = 1.0
+            
+            # Categorize with more granular levels
+            if change_score > 0.8:
+                reason = "Major change - new or significantly modified element"
+            elif change_score > 0.5:
+                reason = "Moderate change - content or style updated"
+            elif change_score > 0.2:
+                reason = "Subtle change - minor updates or style changes"
+            else:
+                reason = "Minimal or no change"
+            
+            # Center-screen boost
+            center_y = (y1 + y2) / (2 * height)
+            center_x = (x1 + x2) / (2 * width)
+            center_distance = np.sqrt((center_x - 0.5)**2 + (center_y - 0.5)**2)
+            center_boost = max(0, 1 - center_distance)
+            
+            final_score = min(1.0, change_score * (1 + 0.3 * center_boost))
+            delta_scores.append((final_score, reason))
+        
+        return delta_scores
 
 
-    def calculate_discoverability_scores(self, screenshot_image, elements, context, last_element):
+    def calculate_discoverability_scores(self, screenshot_image, previous_image, elements, context, last_element):
         age = context["age"]
         tech_savviness = context["tech_savviness"]
         scanning_pattern = self.eye_pattern_predictor.predict(age)
         
-        # Calculate base visual scores with reasoning
-        contrast_scores = [(score, f"Contrast ratio: {score:.2f}, Age factor applied: {age >= 40}") 
-                          for score in self.get_contrast_scores(screenshot_image, elements, age)]
+        # Calculate base visual scores
+        contrast_scores = self.get_contrast_scores(screenshot_image, elements, age)
+        size_scores = self.get_size_scores(screenshot_image, elements, age)
+        interactivity_scores = self.get_interactivity_scores(elements)
+        visual_scores = self.calculate_visual_scores(
+            contrast_scores, 
+            size_scores,
+            interactivity_scores,
+            tech_savviness
+        )
         
-        size_scores = [(score, f"Size score: {score:.2f}, Meets accessibility guidelines: {score > 0.6}") 
-                       for score in self.get_size_scores(screenshot_image, elements, age)]
+        # Calculate delta scores if we have previous screenshot
+        if previous_image is not None:
+            delta_scores = self.calculate_delta_scores(screenshot_image, previous_image, elements)
+        else:
+            # First view - all elements are "new"
+            delta_scores = [(1.0, "Initial view")] * len(elements)
         
-        # Calculate combined visual scores with reasoning
-        visual_scores = []
-        for (c_score, c_reason), (s_score, s_reason) in zip(contrast_scores, size_scores):
-            score = self.calculate_visual_scores([c_score], [s_score], tech_savviness)[0]
-            reasoning = f"Visual prominence: {score:.2f} (Contrast: {c_reason}, Size: {s_reason})"
-            visual_scores.append(self.ScoredElement(score=score, reasoning=reasoning))
-        
-        # Add visual scores to elements for pattern scoring
-        for element, visual_score in zip(elements, visual_scores):
-            element["visual_score"] = visual_score.score
-            element["visual_reasoning"] = visual_score.reasoning
-        
-        # Get pattern scores with reasoning
+        # Get pattern scores
         pattern_scores = find_scanning_pattern_scores(elements, scanning_pattern, last_element)
         
-        # Combine scores with reasoning
-        final_scores = []
+        # Combine scores with heavy weight on delta
         for i, (element, visual_score) in enumerate(zip(elements, visual_scores)):
             pattern_score = pattern_scores[i]
-            final_score = 0.4 * pattern_score + 0.6 * visual_score.score
+            delta_score, delta_reason = delta_scores[i]
+            
+            # Heavy emphasis on changes (0.4), balanced visual (0.3) and pattern (0.3)
+            final_score = (
+                0.4 * delta_score +    # Changes grab immediate attention
+                0.3 * visual_score +   # Visual prominence
+                0.3 * pattern_score    # Scanning pattern influence
+            )
             
             reasoning = f"""
             Final Discoverability: {final_score:.2f}
-            - {visual_score.reasoning}
+            - Change Detection: {delta_score:.2f} ({delta_reason})
+            - Visual Score: {visual_score:.2f} (Contrast: {contrast_scores[i]:.2f}, Size: {size_scores[i]:.2f}, Interactivity: {interactivity_scores[i]:.2f})
             - Pattern Score: {pattern_score:.2f} ({scanning_pattern} pattern)
-            - Tech Savviness: {tech_savviness} influenced visual weight
+            - Tech Savviness: {tech_savviness} influenced weights
             """
             
-            final_scores.append(self.ScoredElement(score=final_score, reasoning=reasoning.strip()))
+            element["discoverability_score"] = final_score
+            element["discoverability_reasoning"] = reasoning.strip()
         
-        return final_scores
+        return
 
 
     async def calculate_understandability_score(self, element, highlighted_image, context):
@@ -284,10 +413,9 @@ class UIRanker:
         response = await chat_anthropic(prompt, highlighted_image, output_schema=GenericOrDomain)
         
         if response.element_type == ElementType.GENERIC:
-            return self.ScoredElement(
-                score=1.0,
-                reasoning=f"Generic UI element: {element['type']} - Highly understandable across all user levels"
-            )
+            element["understandability_score"] = 1.0
+            element["understandability_reasoning"] = f"Generic UI element: {element['type']} - Highly understandable across all user levels"
+            return
         
         # For domain-specific elements
         prompt = f"""You are an expert in {context['domain_knowledge']} domain. 
@@ -309,7 +437,7 @@ class UIRanker:
         
         expertise_response = await chat_anthropic(prompt, highlighted_image, output_schema=ExpertiseLevel)
         required_level = expertise_response.required_level
-        user_level = context["domain_knowledge_level"]
+        user_level = context["domain_familiarity"]
         
         # Same scoring matrix as before
         scoring_matrix = {
@@ -339,11 +467,12 @@ class UIRanker:
         - Domain: {context['domain_knowledge']}
         """
         
-        return self.ScoredElement(score=score, reasoning=reasoning.strip())
+        element["understandability_score"] = score
+        element["understandability_reasoning"] = reasoning.strip()
+        return
 
 
     def calculate_semantic_relevance_scores(self, image, elements, task):
-        scored_elements = []
         for element in elements:
             cropped_icon = get_cropped_icon(image, element)
             score = evaluate_cropped_icon(cropped_icon, task, self.model, self.tokenizer)
@@ -355,94 +484,99 @@ class UIRanker:
             - Relevance: {'High' if score > 0.7 else 'Medium' if score > 0.4 else 'Low'}
             """
             
-            scored_elements.append(self.ScoredElement(score=score, reasoning=reasoning.strip()))
+            element["semantic_relevance_score"] = score
+            element["semantic_relevance_reasoning"] = reasoning.strip()
         
-        return scored_elements
+        return
 
 
-    def rank_elements(self, screenshot_image, elements, task, context, last_element):
+    def rank_elements(self, screenshot_image, previous_screenshot_image, elements, task, context, last_element):
+        assert (screenshot_image.width, screenshot_image.height) == (1920, 1080), "Screenshot must be 1920x1080"
+        
         elements = [
             {
-                "element_id": f"{item['type']}_{item['id']}",
                 "type": item["type"],
-                "text": item["content"],
+                "text": item["text"],
                 "bounds": {
-                    "x1": min(item["bbox"][0], item["bbox"][2]),
-                    "x2": max(item["bbox"][0], item["bbox"][2]),
-                    "y1": min(item["bbox"][1], item["bbox"][3]),
-                    "y2": max(item["bbox"][1], item["bbox"][3])
+                    "x1": item["x"] / screenshot_image.width,
+                    "x2": (item["x"] + item["width"]) / screenshot_image.width,
+                    "y1": item["y"] / screenshot_image.height,
+                    "y2": (item["y"] + item["height"]) / screenshot_image.height
                 },
-                "position": ((item["bbox"][0] + item["bbox"][2]) / 2, (item["bbox"][1] + item["bbox"][3]) / 2)
+                "position": (
+                    # Find center by averaging left and right edges (normalized to 0-1)
+                    (item["x"] + (item["x"] + item["width"])) / (2 * screenshot_image.width),
+                    # Find center by averaging top and bottom edges (normalized to 0-1)
+                    (item["y"] + (item["y"] + item["height"])) / (2 * screenshot_image.height)
+                )
             }
-            for item in elements
+            for i, item in enumerate(elements)
         ]
         
-        # elements = self.get_elements_from_image(screenshot_image)
+        last_element = {
+            "type": last_element["type"],
+            "text": last_element["text"],
+            "bounds": {
+                "x1": last_element["x"] / screenshot_image.width,
+                "x2": (last_element["x"] + last_element["width"]) / screenshot_image.width,
+                "y1": last_element["y"] / screenshot_image.height,
+                "y2": (last_element["y"] + last_element["height"]) / screenshot_image.height
+            },
+            "position": (
+                (last_element["x"] + (last_element["x"] + last_element["width"])) / (2 * screenshot_image.width),
+                (last_element["y"] + (last_element["y"] + last_element["height"])) / (2 * screenshot_image.height)
+            )
+        }
         
         # Discoverability
-        discoverability_scores = self.calculate_discoverability_scores(screenshot_image, elements, context, last_element)
+        self.calculate_discoverability_scores(screenshot_image, previous_screenshot_image, elements, context, last_element)
         
         # Understandability
-        understandability_scores = asyncio.run(asyncio.gather(*[
-            self.calculate_understandability_score(element, draw_bounding_box(screenshot_image, element), context) 
-            for element in elements
-        ]))
+        asyncio.run(
+            asyncio.gather(*[
+                self.calculate_understandability_score(element, draw_bounding_box(screenshot_image, element), context) 
+                for element in elements
+            ])
+        )
         
         # Semantic relevance
-        semantic_scores = self.calculate_semantic_relevance_scores(screenshot_image, elements, task)
+        self.calculate_semantic_relevance_scores(screenshot_image, elements, task)
         
         # Weighted average of the scores
-        final_scores = []
         for i, element in enumerate(elements):
-            d_score = discoverability_scores[i]
-            u_score = understandability_scores[i]
-            s_score = semantic_scores[i]
+            d_score = element["discoverability_score"]
+            u_score = element["understandability_score"]
+            s_score = element["semantic_relevance_score"]
             
             final_score = (
-                0.3 * d_score.score +
-                0.3 * u_score.score +
-                0.4 * s_score.score
+                0.3 * d_score +
+                0.3 * u_score +
+                0.4 * s_score
             )
             
             reasoning = f"""
             Final Score: {final_score:.2f} for {element['type']}
             
-            1. Discoverability ({d_score.score:.2f}):
-            {d_score.reasoning}
+            1. Discoverability ({d_score:.2f}):
+            {element["discoverability_reasoning"]}
             
-            2. Understandability ({u_score.score:.2f}):
-            {u_score.reasoning}
+            2. Understandability ({u_score:.2f}):
+            {element["understandability_reasoning"]}
             
-            3. Semantic Relevance ({s_score.score:.2f}):
-            {s_score.reasoning}
+            3. Semantic Relevance ({s_score:.2f}):
+            {element["semantic_relevance_reasoning"]}
             """
             
-            final_scores.append((final_score, reasoning.strip()))
+            element["final_score"] = final_score
+            element["final_reasoning"] = reasoning.strip()
         
-        return final_scores
+        return sorted(elements, key=lambda x: x["final_score"], reverse=True)
 
 
-def get_last_interaction(scratchpad):
-    """Extract the last element interacted with from the scratchpad"""
-    if not scratchpad:
-        return None
-        
-    # Split scratchpad into individual actions
-    actions = [action.strip() for action in scratchpad.split('\n') if action.strip()]
-    if not actions:
-        return None
-        
-    # Get the last action and extract element info
-    last_action = actions[-1]
-    return {
-        "action": last_action,
-        "element_id": None  # You might want to parse this from the action text
-    }
-
-def get_next_element(screenshot_image, task, context, scratchpad):
-    last_interaction = get_last_interaction(scratchpad)
+def get_next_element(screenshot_image, previous_screenshot_image, task, context, scratchpad, elements, prev_action):
     if scratchpad:
-        prompt = f"""You are a {context["age"]} years old {context["role"]} with {context["domain_knowledge_level"]} {context["domain_knowledge"]} domain expertise and {context["tech_savviness"]} tech savviness, navigating a UI to complete a specific task. 
+        scratchpad_str = '\n------------\n'.join([f'{action["content"]}' for i, action in enumerate(scratchpad)])
+        prompt = f"""You are a {context["age"]} years old {context["domain_familiarity"]} level {context["domain"]}, with {context["tech_savviness"]} tech savviness, navigating a UI to complete a specific task. 
 
 TASK OBJECTIVE:
 ```
@@ -450,39 +584,39 @@ TASK OBJECTIVE:
 ```
 
 INTERACTION HISTORY:
-You have performed these actions in sequence:
+This is your report of the actions you have performed:
 ```
-{scratchpad}
+{scratchpad_str}
 ```
-Last interaction: {last_interaction["action"] if last_interaction else "Starting fresh"}
 
 CURRENT SITUATION:
 Looking at the current screenshot and considering the interaction history:
 1. Does the current page still lead toward the task objective?
 2. Have we moved away from the logical path to complete the task?
-3. Would a typical {context["role"]} with {context["domain_knowledge_level"]} {context["domain_knowledge"]} domain expertise and {context["tech_savviness"]} tech savviness realize they need to backtrack?
+3. Would a typical {context["domain_familiarity"]} {context["domain"]} with {context["tech_savviness"]} tech savviness realize they need to backtrack?
 
 DECISION NEEDED:
 Should we continue from this point or backtrack to a previous state?"""
-
+        
         class BacktrackDecision(BaseModel):
             '''Evaluation of whether to continue or backtrack based on task progress'''
             backtrack: bool = Field(
-                description="True if user should return to a previous state (wrong path/dead end), False if current path still leads to objective"
+                description="True if you should return to a previous state (wrong path/dead end), False if current path still leads to objective"
             )
             confidence: float = Field(
-                description="Confidence in this decision (0.0-1.0). Consider user's expertise and clarity of the situation",
+                description="Confidence in this decision (0.0-1.0). Consider your expertise and clarity of the situation",
                 ge=0.0,
                 le=1.0
             )
             reasoning: str = Field(
-                description="Brief explanation of why this decision makes sense for this user profile"
+                description="Brief explanation of why this decision makes sense for your current situation"
             )
-
+            
         response = asyncio.run(chat_anthropic(prompt, screenshot_image, output_schema=BacktrackDecision))
-        
+    
         if response.backtrack and response.confidence > 0.5:
-            return "backtrack", response.reasoning
+            return "backtrack", "", response.reasoning
     
     ui_ranker = UIRanker()    
-    return ui_ranker.rank_elements(screenshot_image, task, context, last_interaction)[-1]
+    last_element = prev_action.get("bounding", None)
+    return ui_ranker.rank_elements(screenshot_image, previous_screenshot_image, elements, task, context, last_element)

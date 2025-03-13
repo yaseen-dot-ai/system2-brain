@@ -17,8 +17,9 @@ from typing import Optional, List
 import os
 
 
-def get_cropped_icon(image, element, ratio=0.04):
-    image_width, image_height = image.size
+def get_cropped_icon(image, element, ratio=0.30):
+    highlighted_image = draw_bounding_box(image, element)
+    image_width, image_height = highlighted_image.size
     x, y = element["position"]
         
     # Convert normalized coordinates to pixel coordinates
@@ -55,11 +56,67 @@ def get_cropped_icon(image, element, ratio=0.04):
     cropped_array = image_array[y1:y2, x1:x2, :]  # Include all channels
     cropped_icon = Image.fromarray(cropped_array).convert('RGB')
     return cropped_icon
+
+def process_single_image(image, model_processor, prompt=None):
+    """Process a single image through the model to generate caption/description.
     
+    Args:
+        image: Single PIL image
+        model_processor: Dict containing model and processor
+        prompt: Optional prompt text to guide generation
+    """
+    model, processor = model_processor['model'], model_processor['processor']
+    
+    # Set default prompt based on model type
+    if not prompt:
+        if 'florence' in model.config.name_or_path:
+            prompt = "<CAPTION>"
+        else:
+            prompt = "The image shows"
+    
+    device = model.device
+    
+    # Process single image
+    if model.device.type == 'cuda':
+        inputs = processor(
+            images=image, 
+            text=prompt, 
+            return_tensors="pt", 
+            do_resize=False
+        ).to(device=device, dtype=torch.float16)
+    else:
+        inputs = processor(
+            images=image, 
+            text=prompt, 
+            return_tensors="pt"
+        ).to(device=device)
+    
+    # Generate text based on model type
+    if 'florence' in model.config.name_or_path:
+        generated_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=20,
+            num_beams=1,
+            do_sample=False
+        )
+    else:
+        generated_ids = model.generate(
+            **inputs,
+            max_length=100,
+            num_beams=5,
+            no_repeat_ngram_size=2,
+            early_stopping=True,
+            num_return_sequences=1
+        )
+    
+    # Decode and clean up generated text
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return generated_text.strip()
 
 def evaluate_cropped_icon(cropped_icon, task_description, cross_encoder, tokenizer):
-    # cropped_icon.resize((64, 64), resample=Image.Resampling.LANCZOS)
-    caption = chat_vllm(cropped_icon, "What are the UI elements in this image and what are they used for ? Answer in one sentence.")
+    cropped_icon.resize((256, 256), resample=Image.Resampling.LANCZOS)
+    caption = process_single_image(cropped_icon, "What is the purpose of the highlighted UI element in this image ? Answer in one sentence.")
     
     cross_encoder.eval()
     with torch.no_grad():
