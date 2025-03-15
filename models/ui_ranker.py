@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import numpy as np
 from pydantic import BaseModel, Field
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch
 
 from models.eye_pattern import EyePatternPredictor
 from models.op_utils.omniparser import Omniparser
@@ -381,24 +382,6 @@ class UIRanker:
 
 
     async def calculate_understandability_score(self, element, highlighted_image, context):
-        """
-        Calculate understandability score based on:
-        1. Whether element is generic (common across all UIs) or domain-specific (requires field knowledge)
-        2. For domain-specific elements, how complex is the domain concept
-        
-        Examples:
-        Generic elements:
-        - Home button, Back button, Search bar, Menu icon, Settings gear
-        - Basic form elements (submit, cancel, checkbox)
-        - Navigation elements (tabs, links, breadcrumbs)
-        
-        Domain-specific elements:
-        - Financial: Fiscal quarter input, P/E ratio field, EBITDA calculator
-        - Medical: ICD-10 code entry, dosage calculator, diagnosis fields
-        - Engineering: Tolerance specification, material property inputs
-        """
-        from enum import Enum
-    
         # First determine if element is generic or domain-specific
         prompt = """You are an intelligent UI designer. Your task is to determine if the highlighted UI element is:
         
@@ -419,66 +402,119 @@ class UIRanker:
         response = await chat_anthropic(prompt, highlighted_image, output_schema=GenericOrDomain)
         
         if response.element_type == ElementType.GENERIC:
-            element["understandability_score"] = 1.0
-            element["understandability_reasoning"] = f"Generic UI element: {element['type']} - Highly understandable across all user levels"
+            if context["tech_savviness"] == "LOW":
+                element["understandability_score"] = 0.5
+                element["understandability_reasoning"] = f"Generic UI element: {element['type']} - Low tech savviness"
+            elif context["tech_savviness"] == "MEDIUM":
+                element["understandability_score"] = 0.7
+                element["understandability_reasoning"] = f"Generic UI element: {element['type']} - Medium tech savviness"
+            else:
+                element["understandability_score"] = 0.9
+                element["understandability_reasoning"] = f"Generic UI element: {element['type']} - High tech savviness"
             return
         
-        # For domain-specific elements
-        prompt = f"""You are an expert in {context['domain']} domain. 
-        Determine how complex the domain concept behind this UI element is.
+        # For domain-specific elements, first determine the element's domain
+        domain_prompt = """You are an expert in UI analysis. Determine which domain/field this UI element belongs to.
         
         Examples:
-        BEGINNER: Basic industry terms, common metrics
-        INTERMEDIATE: Standard industry calculations, specialized inputs
-        EXPERT: Complex domain concepts, expert-level metrics"""
+        - A "P/E Ratio" field belongs to "Finance/Investment"
+        - A "Blood Pressure" input belongs to "Healthcare/Medical"
+        - A "Compiler Options" setting belongs to "Software Development"
+        - A "Torque Settings" control belongs to "Mechanical Engineering"
+
+        Be specific about the domain."""
+
+        class DomainResponse(BaseModel):
+            domain: str = Field(description="The specific domain/field this UI element belongs to")
+
+        domain_response = await chat_anthropic(domain_prompt, highlighted_image, output_schema=DomainResponse)
+        element_domain = domain_response.domain
+        user_domain = context['domain']
+
+        # Calculate domain similarity using reranker model
+        pairs = [[element_domain, user_domain]]
+        features = self.tokenizer(
+            pairs,
+            padding=True,
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        with torch.no_grad():
+            scores = self.model(**features).logits.flatten()
+        domain_similarity = scores[0].item()  # Already between 0-1, no sigmoid needed
+
+        # Then get expertise level match as before
+        expertise_prompt = f"""You are an expert in {element_domain}. 
+        Determine how complex the domain concept behind this UI element is.
+        
+        Experience levels:
+        BEGINNER: College-level knowledge, understands fundamental concepts
+        - Example: Basic financial ratios, standard medical terms, programming language syntax
+        - Typical: Recent graduate or someone with academic knowledge
+        
+        INTERMEDIATE: ~2 years of industry experience
+        - Example: Industry-standard workflows, common professional tools, practical applications
+        - Typical: Working professional with hands-on experience
+        
+        EXPERT: Deep industry experience (5+ years)
+        - Example: Complex domain-specific optimizations, advanced professional tools, edge cases
+        - Typical: Senior professional or domain specialist"""
         
         class UnderstandingLevel(str, Enum):
-            BEGINNER = "beginner"      # Beginner-friendly elements
-            INTERMEDIATE = "intermediate"  # Intermediate-level elements
-            EXPERT = "expert"    # Expert-level elements
+            BEGINNER = "beginner"      # College-level knowledge
+            INTERMEDIATE = "intermediate"  # ~2 years industry experience
+            EXPERT = "expert"    # Deep industry experience (5+ years)
         
         class ExpertiseLevel(BaseModel):
             required_level: UnderstandingLevel = Field(
                 description=f"""
-                BEGINNER: Basic domain concepts (simple industry terms)
-                INTERMEDIATE: Standard domain operations (common calculations)
-                EXPERT: Complex domain concepts (expert-level metrics)
+                BEGINNER: College-level knowledge, understands fundamentals
+                INTERMEDIATE: ~2 years industry experience, practical knowledge
+                EXPERT: Deep industry experience (5+ years), specialist knowledge
                 """
             )
         
-        expertise_response = await chat_anthropic(prompt, highlighted_image, output_schema=ExpertiseLevel)
+        expertise_response = await chat_anthropic(expertise_prompt, highlighted_image, output_schema=ExpertiseLevel)
         required_level = expertise_response.required_level
         user_level = context["domain_familiarity"].lower()
         
-        # Same scoring matrix as before
+        # Expertise scoring matrix
         scoring_matrix = {
             "expert": {
-                "expert": 1.0,    # Expert with complex concept
-                "intermediate": 1.0,  # Expert with standard concept
-                "beginner": 1.0      # Expert with basic concept
+                "expert": 1.0,
+                "intermediate": 1.0,
+                "beginner": 1.0
             },
             "intermediate": {
-                "expert": 0.7,    # Intermediate with complex concept
-                "intermediate": 1.0,  # Intermediate with standard concept
-                "beginner": 1.0      # Intermediate with basic concept
+                "expert": 0.7,
+                "intermediate": 1.0,
+                "beginner": 1.0
             },
             "beginner": {
-                "expert": 0.2,    # Beginner with complex concept
-                "intermediate": 0.4,  # Beginner with standard concept
-                "beginner": 0.7      # Beginner with basic concept
+                "expert": 0.2,
+                "intermediate": 0.4,
+                "beginner": 0.7
             }
         }
         
-        score = scoring_matrix[user_level][required_level]
+        expertise_score = scoring_matrix[user_level][required_level]
+        
+        # Combine domain similarity with expertise score
+        final_score = domain_similarity * expertise_score
+        
         reasoning = f"""
         Domain-specific element: {element['type']}
+        - Element domain: {element_domain}
+        - User domain: {user_domain}
+        - Domain similarity: {domain_similarity:.2f}
         - Required expertise: {required_level}
         - User expertise: {user_level}
-        - Score: {score:.2f} based on expertise gap
-        - Domain: {context['domain']}
+        - Expertise score: {expertise_score:.2f}
+        - Final score: {final_score:.2f} (domain_similarity * expertise_score)
         """
         
-        element["understandability_score"] = score
+        element["understandability_score"] = final_score
         element["understandability_reasoning"] = reasoning.strip()
         return
 
@@ -569,22 +605,28 @@ class UIRanker:
             u_score = element["understandability_score"]
             s_score = element["semantic_relevance_score"]
             
+            # Soften multiplicative effects with decreasing powers while 
+            # maintaining sequential dependency
             final_score = (
-                0.3 * d_score +
-                0.3 * u_score +
-                0.4 * s_score
+                d_score ** 2.0 *          # Strongest penalty for low discoverability
+                u_score ** 1.5 *          # Medium penalty for low understandability
+                s_score ** 1.2            # Lightest penalty for low semantic relevance
             )
             
             reasoning = f"""
             Final Score: {final_score:.2f} for {element['type']}
-            
-            1. Discoverability ({d_score:.2f}):
+
+            Sequential Evaluation (with softened multiplicative effects):
+            1. Discoverability ({d_score:.2f} → {d_score**2.0:.2f}):
+                - Primary gateway - harshest penalty if not discoverable
             {element["discoverability_reasoning"]}
-            
-            2. Understandability ({u_score:.2f}):
+
+            2. Understandability ({u_score:.2f} → {u_score**1.5:.2f}):
+                - Secondary factor - medium penalty
             {element["understandability_reasoning"]}
-            
-            3. Semantic Relevance ({s_score:.2f}):
+
+            3. Semantic Relevance ({s_score:.2f} → {s_score**1.2:.2f}):
+                - Tertiary factor - lightest penalty
             {element["semantic_relevance_reasoning"]}
             """
             
