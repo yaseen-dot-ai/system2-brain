@@ -17,8 +17,11 @@ from typing import Optional, List
 import os
 
 
-def get_cropped_icon(image, element, ratio=0.30):
-    highlighted_image = draw_bounding_box(image, element)
+def get_cropped_icon(image, element, ratio=0.30, bounding_box=False):
+    if bounding_box:
+        highlighted_image = draw_bounding_box(image, element)
+    else:
+        highlighted_image = image
     image_width, image_height = highlighted_image.size
     x, y = element["position"]
         
@@ -57,38 +60,43 @@ def get_cropped_icon(image, element, ratio=0.30):
     cropped_icon = Image.fromarray(cropped_array).convert('RGB')
     return cropped_icon
 
-def process_single_image(image, caption_model, prompt=None):
-    """Process a single image through the model to generate caption/description.
+def caption_images(images, caption_model, prompts=None):
+    """Process a batch of images through the model to generate captions/descriptions.
     
     Args:
-        image: Single PIL image
+        images: List of PIL images or single PIL image
         model_processor: Dict containing model and processor
-        prompt: Optional prompt text to guide generation
+        prompt: Optional prompt text or list of prompts to guide generation
     """
-    model, processor = caption_model['model'], caption_model['processor']
+    # Convert single image/prompt to list for batch processing
+    if not isinstance(images, list):
+        images = [images]
+        
+    if not prompts:
+        default_prompt = "<CAPTION>" if 'florence' in model.config.name_or_path else "The image shows"
+        prompts = [default_prompt] * len(images)
+    elif not isinstance(prompts, list):
+        prompts = [prompts] * len(images)
     
-    # Set default prompt based on model type
-    if not prompt:
-        if 'florence' in model.config.name_or_path:
-            prompt = "<CAPTION>"
-        else:
-            prompt = "The image shows"
+    model, processor = caption_model['model'], caption_model['processor']
     
     device = model.device
     
-    # Process single image
+    # Process batch of images
     if model.device.type == 'cuda':
         inputs = processor(
-            images=image, 
-            text=prompt, 
+            images=images, 
+            text=prompts, 
             return_tensors="pt", 
-            do_resize=False
+            do_resize=False,
+            padding=True
         ).to(device=device, dtype=torch.float16)
     else:
         inputs = processor(
-            images=image, 
-            text=prompt, 
-            return_tensors="pt"
+            images=images, 
+            text=prompts, 
+            return_tensors="pt",
+            padding=True
         ).to(device=device)
     
     # Generate text based on model type
@@ -111,20 +119,72 @@ def process_single_image(image, caption_model, prompt=None):
         )
     
     # Decode and clean up generated text
-    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return generated_text.strip()
+    generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=True)
+    generated_texts = [text.strip() for text in generated_texts]
+    
+    # Return single string if input was single image, otherwise return list
+    return generated_texts[0] if len(generated_texts) == 1 else generated_texts
 
 
-def evaluate_cropped_icon(cropped_icon, task_description, cross_encoder, tokenizer, caption_model):
-    cropped_icon.resize((256, 256), resample=Image.Resampling.LANCZOS)
-    caption = process_single_image(cropped_icon, caption_model, "What is the purpose of the highlighted UI element in this image ? Answer in one sentence.")
+def classify_text_pairs(task_descriptions, captions, cross_encoder, tokenizer):
+    """Evaluate pairs of texts using a cross encoder model.
+    
+    Args:
+        task_descriptions: List of task descriptions or single task description
+        captions: List of captions or single caption
+        cross_encoder: Cross encoder model
+        tokenizer: Tokenizer for cross encoder
+    
+    Returns:
+        Float score for single pair or list of scores for multiple pairs
+    """
+    # Convert single inputs to lists
+    if not isinstance(task_descriptions, list):
+        task_descriptions = [task_descriptions]
+    if not isinstance(captions, list):
+        captions = [captions]
+        
+    # Prepare pairs for cross encoder
+    pairs = []
+    for task, caption in zip(task_descriptions, captions):
+        pairs.extend([task, caption])
     
     cross_encoder.eval()
     with torch.no_grad():
-        inputs = tokenizer([task_description, caption], padding=True, truncation=True, return_tensors='pt', max_length=512)
-        score = cross_encoder(**inputs, return_dict=True).logits.view(-1, ).float()[0].item()
+        inputs = tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+        scores = cross_encoder(**inputs, return_dict=True).logits.view(-1).float()
     
-    return score
+    # Return single score if input was single pair, otherwise return list
+    return scores[0].item() if len(scores) == 1 else scores.tolist()
+
+
+def evaluate_cropped_icons(cropped_icons, task_descriptions, cross_encoder, tokenizer, caption_model):
+    """Evaluate a batch of cropped icons against their task descriptions.
+    
+    Args:
+        cropped_icons: List of PIL images or single PIL image
+        task_descriptions: List of task descriptions or single task description
+        cross_encoder: Cross encoder model
+        tokenizer: Tokenizer for cross encoder
+        caption_model: Caption model dict containing model and processor
+    """
+    # Convert single inputs to lists for batch processing
+    if not isinstance(cropped_icons, list):
+        cropped_icons = [cropped_icons]
+    if not isinstance(task_descriptions, list):
+        task_descriptions = [task_descriptions] * len(cropped_icons)
+        
+    # Resize all icons
+    resized_icons = [icon.resize((256, 256), resample=Image.Resampling.LANCZOS) for icon in cropped_icons]
+    
+    # Generate captions for all icons
+    prompt = "What is the purpose of the highlighted UI element in this image ? Answer in one sentence."
+    captions = caption_images(resized_icons, caption_model, [prompt] * len(resized_icons))
+    
+    # Classify pairs using cross encoder
+    scores = classify_text_pairs(task_descriptions, captions, cross_encoder, tokenizer)
+    
+    return scores
 
 
 def get_color_for_timestep(timestep, max_timesteps):

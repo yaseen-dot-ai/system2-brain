@@ -1,7 +1,6 @@
 import asyncio
 from enum import Enum
 import os
-from typing import Optional
 from dotenv import load_dotenv
 
 import numpy as np
@@ -11,7 +10,10 @@ import torch
 
 from models.eye_pattern import EyePatternPredictor
 from models.op_utils.omniparser import Omniparser
-from models.utils import get_cropped_icon, evaluate_cropped_icon, chat_anthropic, find_scanning_pattern_scores, draw_bounding_box
+from models.utils import get_cropped_icon, evaluate_cropped_icons, chat_anthropic, find_scanning_pattern_scores, draw_bounding_box, classify_text_pairs
+
+from typing import TypedDict, List, Dict, Any
+
 
 load_dotenv()
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -518,22 +520,82 @@ class UIRanker:
         element["understandability_reasoning"] = reasoning.strip()
         return
 
+    
+    async def calculate_semantic_relevance_scores(self, image, elements, task, context):
+        planner_prompt = f"""You are a {context['title']} with expertise in {context['ranking_persona']} and a solid understanding of the tools you utilize. Your decisions should be informed by your background, qualifications, and general knowledge.
+Your primary objective is to: {task}
+You will receive a screenshot of a web application from the user. Based on the provided list of available actions, your task is to identify the action that you believe will most effectively help achieve your goal. Please provide a clear rationale for your choice.
+Here is the list of available actions:
+{context['available_actions']}
+Take your time to consider which action will best support your goal. Clearly articulate your rationale and selected action in a concise and human-like manner.
+<example>
+Rationale: To share the document with 'vaibhav@featurely.ai', the most effective action is to use the "Share" feature. This will allow you to directly share the document via email, ensuring that the recipient can access it easily. The "Share" button is typically used for this purpose in collaborative platforms like Dropbox Paper.
+Action: Click (Binding Box 27) - Share the document.
+</example>"""
 
-    def calculate_semantic_relevance_scores(self, image, elements, task):
-        for element in elements:
-            cropped_icon = get_cropped_icon(image, element)
-            score = evaluate_cropped_icon(cropped_icon, task, self.model, self.tokenizer, self.omniparser.caption_model_processor)
+        class RankedAction(TypedDict):
+            action: str
+
+        class ActionRankings(TypedDict):
+            rankings: List[RankedAction]
+            rationale: str
+            confidence: str
             
-            reasoning = f"""
-            Semantic Relevance: {score:.2f}
-            - Element: {element['type']} ({element.get('text', 'no text')})
-            - Task: {task}
-            - Relevance: {'High' if score > 0.7 else 'Medium' if score > 0.4 else 'Low'}
-            """
-            
-            element["semantic_relevance_score"] = score
-            element["semantic_relevance_reasoning"] = reasoning.strip()
+        response = await chat_anthropic(planner_prompt, image, output_schema=ActionRankings)
+        intermediate_task = response.rationale
         
+        # Get cropped images and evaluate their captions against the task
+        cropped_images = [get_cropped_icon(image, element) for element in elements]
+        caption_scores = evaluate_cropped_icons(cropped_images, intermediate_task, self.model, self.tokenizer, self.omniparser.caption_model_processor)
+        
+        assert len(caption_scores) == len(elements)
+        
+        # Evaluate how well each available action aligns with the task
+        available_actions = context["available_actions"].split("\n")
+        action_scores = classify_text_pairs(
+            [intermediate_task]*len(available_actions), 
+            available_actions, 
+            self.model, 
+            self.tokenizer
+        )
+
+        # Assign semantic relevance scores to elements
+        for i, (element, caption_score, action_score) in enumerate(zip(elements, caption_scores, action_scores)):
+            # Weight the aspects of semantic relevance
+            caption_weight = 0.6  # Visual/text relevance from caption
+            action_weight = 0.4   # Action relevance
+            
+            # Calculate weighted score
+            semantic_score = (
+                caption_weight * caption_score +
+                action_weight * action_score
+            )
+            
+            # Generate detailed reasoning
+            element["semantic_score"] = semantic_score
+            element["semantic_reasoning"] = f"""
+            Semantic Relevance Analysis:
+            
+            Overall Score: {semantic_score:.2f}
+            
+            Component Scores:
+            1. Element Purpose Relevance: {caption_score:.2f}
+               - How well the element's purpose matches the task
+               - Based on visual appearance and text content
+               - Weight: {caption_weight:.1f}
+            
+            2. Action Alignment: {action_score:.2f}
+               - How well the element's action supports the task
+               - Weight: {action_weight:.1f}
+            
+            Task Context: 
+            {intermediate_task}
+            
+            Element Details:
+            - Type: {element['type']}
+            - Text: {element['text']}
+            """
+
         return
 
 
@@ -595,7 +657,7 @@ class UIRanker:
         print("Calculated understandability scores...")
         
         # Semantic relevance
-        self.calculate_semantic_relevance_scores(screenshot_image, elements, task)
+        await self.calculate_semantic_relevance_scores(screenshot_image, elements, task, context)
         
         print("Calculated semantic relevance scores...")
         
