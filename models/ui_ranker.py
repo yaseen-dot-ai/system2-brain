@@ -330,9 +330,9 @@ class UIRanker:
         return delta_scores
 
 
-    def calculate_discoverability_scores(self, screenshot_image, previous_image, elements, context, last_element):
-        age = int(context["age"])
-        tech_savviness = context["tech_savviness"]
+    def calculate_discoverability_scores(self, screenshot_image, previous_image, elements, context, last_element = None):
+        age = int(context.age)
+        tech_savviness = context.tech_savviness
         scanning_pattern = self.eye_pattern_predictor.predict(age)
         
         # Calculate base visual scores
@@ -364,9 +364,9 @@ class UIRanker:
             
             # Heavy emphasis on changes (0.4), balanced visual (0.3) and pattern (0.3)
             final_score = (
-                0.4 * delta_score +    # Changes grab immediate attention
+                0.5 * delta_score +    # Changes grab immediate attention
                 0.3 * visual_score +   # Visual prominence
-                0.3 * pattern_score    # Scanning pattern influence
+                0.2 * pattern_score    # Scanning pattern influence
             )
             
             reasoning = f"""
@@ -385,7 +385,7 @@ class UIRanker:
 
     async def calculate_understandability_score(self, element, highlighted_image, context):
         # First determine if element is generic or domain-specific
-        prompt = """You are an intelligent UI designer. Your task is to determine if the highlighted UI element is:
+        prompt = """You are an intelligent UI designer. You are given a screenshot of a web application. Your task is to determine if the highlighted UI element is:
         
         GENERIC: Common elements found across all UIs (like home buttons, search bars, basic navigation)
         DOMAIN_SPECIFIC: Elements specific to a field/industry (like fiscal quarter input, medical diagnosis codes)
@@ -404,19 +404,20 @@ class UIRanker:
         response = await chat_anthropic(prompt, highlighted_image, output_schema=GenericOrDomain)
         
         if response.element_type == ElementType.GENERIC:
-            if context["tech_savviness"] == "LOW":
-                element["understandability_score"] = 0.5
-                element["understandability_reasoning"] = f"Generic UI element: {element['type']} - Low tech savviness"
-            elif context["tech_savviness"] == "MEDIUM":
-                element["understandability_score"] = 0.7
-                element["understandability_reasoning"] = f"Generic UI element: {element['type']} - Medium tech savviness"
-            else:
-                element["understandability_score"] = 0.9
-                element["understandability_reasoning"] = f"Generic UI element: {element['type']} - High tech savviness"
+            # Map tech_savviness to a score using a default case
+            tech_scores = {
+                "LOW": 0.5,
+                "MEDIUM": 0.7,
+                "HIGH": 0.9
+            }
+            # Default to medium tech savviness if unknown value
+            score = tech_scores.get(context.tech_savviness.upper(), 0.7)
+            element["understandability_score"] = score
+            element["understandability_reasoning"] = f"Generic UI element: {element['type']} - {context.tech_savviness} tech savviness"
             return
         
         # For domain-specific elements, first determine the element's domain
-        domain_prompt = """You are an expert in UI analysis. Determine which domain/field this UI element belongs to.
+        domain_prompt = """You are an expert in UI analysis. You are given a screenshot of a web application. Determine which domain/field the highlighted UI element belongs to.
         
         Examples:
         - A "P/E Ratio" field belongs to "Finance/Investment"
@@ -431,7 +432,7 @@ class UIRanker:
 
         domain_response = await chat_anthropic(domain_prompt, highlighted_image, output_schema=DomainResponse)
         element_domain = domain_response.domain
-        user_domain = context['domain']
+        user_domain = context.title
 
         # Calculate domain similarity using reranker model
         pairs = [[element_domain, user_domain]]
@@ -447,8 +448,8 @@ class UIRanker:
         domain_similarity = scores[0].item()  # Already between 0-1, no sigmoid needed
 
         # Then get expertise level match as before
-        expertise_prompt = f"""You are an expert in {element_domain}. 
-        Determine how complex the domain concept behind this UI element is.
+        expertise_prompt = f"""You are an expert in {element_domain}. You are given a screenshot of a web application.
+        Determine how complex the domain concept behind the highlighted UI element is.
         
         Experience levels:
         BEGINNER: College-level knowledge, understands fundamental concepts
@@ -479,29 +480,26 @@ class UIRanker:
         
         expertise_response = await chat_anthropic(expertise_prompt, highlighted_image, output_schema=ExpertiseLevel)
         required_level = expertise_response.required_level
-        user_level = context["domain_familiarity"].lower()
+        user_level = context.domain_familiarity.lower()
         
-        # Expertise scoring matrix
-        scoring_matrix = {
-            "expert": {
-                "expert": 1.0,
-                "intermediate": 1.0,
-                "beginner": 1.0
-            },
-            "intermediate": {
-                "expert": 0.7,
-                "intermediate": 1.0,
-                "beginner": 1.0
-            },
-            "beginner": {
-                "expert": 0.2,
-                "intermediate": 0.4,
-                "beginner": 0.7
-            }
+        # More flexible expertise scoring - handle any user level
+        expertise_levels = {
+            "beginner": 0,
+            "intermediate": 1,
+            "expert": 2
         }
         
-        expertise_score = scoring_matrix[user_level][required_level]
+        # Get numeric levels, defaulting to intermediate (1) if unknown
+        user_level_num = expertise_levels.get(user_level, 1)
+        required_level_num = expertise_levels.get(required_level, 1)
         
+        # Calculate expertise score based on level difference
+        if user_level_num >= required_level_num:
+            expertise_score = 1.0  # User meets or exceeds required level
+        else:
+            # Decrease score by 0.3 for each level gap
+            expertise_score = max(0.1, 1.0 - (0.3 * (required_level_num - user_level_num)))
+
         # Combine domain similarity with expertise score
         final_score = domain_similarity * expertise_score
         
@@ -512,7 +510,7 @@ class UIRanker:
         - Domain similarity: {domain_similarity:.2f}
         - Required expertise: {required_level}
         - User expertise: {user_level}
-        - Expertise score: {expertise_score:.2f}
+        - Expertise score: {expertise_score:.2f} (based on expertise level difference)
         - Final score: {final_score:.2f} (domain_similarity * expertise_score)
         """
         
@@ -521,16 +519,16 @@ class UIRanker:
         return
 
     
-    async def calculate_semantic_relevance_scores(self, image, elements, task, context):
-        planner_prompt = f"""You are a {context['title']} with expertise in {context['ranking_persona']} and a solid understanding of the tools you utilize. Your decisions should be informed by your background, qualifications, and general knowledge.
+    async def calculate_semantic_relevance_scores(self, image, elements, task, context, available_actions):
+        planner_prompt = f"""You are a {context.age} year old {context.domain_familiarity} level {context.title} with {context.tech_savviness} tech savviness. Your decisions should be informed by your background, qualifications, and general knowledge.
 Your primary objective is to: {task}
 You will receive a screenshot of a web application from the user. Based on the provided list of available actions, your task is to identify the action that you believe will most effectively help achieve your goal. Please provide a clear rationale for your choice.
 Here is the list of available actions:
-{context['available_actions']}
+{available_actions}
 Take your time to consider which action will best support your goal. Clearly articulate your rationale and selected action in a concise and human-like manner.
 <example>
 Rationale: To share the document with 'vaibhav@featurely.ai', the most effective action is to use the "Share" feature. This will allow you to directly share the document via email, ensuring that the recipient can access it easily. The "Share" button is typically used for this purpose in collaborative platforms like Dropbox Paper.
-Action: Click (Binding Box 27) - Share the document.
+Action: Click (Bounding Box 27) - Share the document.
 </example>"""
 
         class RankedAction(TypedDict):
@@ -546,60 +544,40 @@ Action: Click (Binding Box 27) - Share the document.
         
         # Get cropped images and evaluate their captions against the task
         cropped_images = [get_cropped_icon(image, element) for element in elements]
-        caption_scores = evaluate_cropped_icons(cropped_images, intermediate_task, self.model, self.tokenizer, self.omniparser.caption_model_processor)
+        scores = evaluate_cropped_icons(cropped_images, intermediate_task, self.model, self.tokenizer, self.omniparser.caption_model_processor)
         
-        assert len(caption_scores) == len(elements)
+        if isinstance(available_actions, str):
+            available_actions = available_actions.split("\n")
         
-        # Evaluate how well each available action aligns with the task
-        available_actions = context["available_actions"].split("\n")
-        action_scores = classify_text_pairs(
-            [intermediate_task]*len(available_actions), 
-            available_actions, 
-            self.model, 
-            self.tokenizer
-        )
-
         # Assign semantic relevance scores to elements
-        for i, (element, caption_score, action_score) in enumerate(zip(elements, caption_scores, action_scores)):
-            # Weight the aspects of semantic relevance
-            caption_weight = 0.6  # Visual/text relevance from caption
-            action_weight = 0.4   # Action relevance
-            
-            # Calculate weighted score
-            semantic_score = (
-                caption_weight * caption_score +
-                action_weight * action_score
-            )
-            
-            # Generate detailed reasoning
-            element["semantic_score"] = semantic_score
+        for i, (element, score) in enumerate(zip(elements, scores)):
+            element["semantic_score"] = score
+            valid_actions = [action for action in available_actions if f'Bounding Box {i}' in action]
+            element["semantic_action"] = valid_actions[0] if valid_actions else f"Click (Bounding Box {i})"
             element["semantic_reasoning"] = f"""
-            Semantic Relevance Analysis:
-            
-            Overall Score: {semantic_score:.2f}
-            
-            Component Scores:
-            1. Element Purpose Relevance: {caption_score:.2f}
-               - How well the element's purpose matches the task
-               - Based on visual appearance and text content
-               - Weight: {caption_weight:.1f}
-            
-            2. Action Alignment: {action_score:.2f}
-               - How well the element's action supports the task
-               - Weight: {action_weight:.1f}
-            
-            Task Context: 
+            Semantic Relevance Score: {score:.2f}
+
+            Task Analysis:
             {intermediate_task}
-            
-            Element Details:
+
+            Element Analysis:
             - Type: {element['type']}
-            - Text: {element['text']}
+            - Content: {element['text']}
+            - Purpose: Evaluated how well this element's visual and textual 
+              characteristics align with the current task requirements
+            
+            Reasoning:
+            - Score indicates {'strong' if score > 0.8 else 'moderate' if score > 0.5 else 'weak'} relevance 
+              to the current task objective
+            - {'This element appears to be highly relevant to the task at hand' if score > 0.8 
+              else 'This element shows some relevance to the task' if score > 0.5 
+              else 'This element appears less relevant for the current task'}
             """
 
-        return
+        return response.rationale
 
 
-    async def rank_elements(self, screenshot_image, previous_screenshot_image, original_elements, task, context, original_last_element):
+    async def rank_elements(self, screenshot_image, previous_screenshot_image, original_elements, task, context, available_actions):
         # assert (screenshot_image.width, screenshot_image.height) == (1920, 1080), f"Screenshot must be 1920x1080, got {screenshot_image.width}x{screenshot_image.height}"
         
         elements = [
@@ -623,28 +601,10 @@ Action: Click (Binding Box 27) - Share the document.
             for i, item in enumerate(original_elements)
         ]
         
-        last_element = None
-        if original_last_element:
-            last_element = {
-                "element_id": f"{original_last_element.type}-{original_last_element.text}-{original_last_element.x}-{original_last_element.y}-{original_last_element.width}-{original_last_element.height}",
-                "type": original_last_element.type,
-                "text": original_last_element.text,
-                "bounds": {
-                    "x1": original_last_element.x / screenshot_image.width,
-                    "x2": (original_last_element.x + original_last_element.width) / screenshot_image.width,
-                    "y1": original_last_element.y / screenshot_image.height,
-                    "y2": (original_last_element.y + original_last_element.height) / screenshot_image.height
-                },
-                "position": (
-                    (original_last_element.x + (original_last_element.x + original_last_element.width)) / (2 * screenshot_image.width),
-                    (original_last_element.y + (original_last_element.y + original_last_element.height)) / (2 * screenshot_image.height)
-                )
-            }
-        
         print("Parsed elements...")
         
         # Discoverability
-        self.calculate_discoverability_scores(screenshot_image, previous_screenshot_image, elements, context, last_element)
+        self.calculate_discoverability_scores(screenshot_image, previous_screenshot_image, elements, context)
         
         print("Calculated discoverability scores...")
         
@@ -657,7 +617,7 @@ Action: Click (Binding Box 27) - Share the document.
         print("Calculated understandability scores...")
         
         # Semantic relevance
-        await self.calculate_semantic_relevance_scores(screenshot_image, elements, task, context)
+        rationale = await self.calculate_semantic_relevance_scores(screenshot_image, elements, task, context, available_actions)
         
         print("Calculated semantic relevance scores...")
         
@@ -689,13 +649,61 @@ Action: Click (Binding Box 27) - Share the document.
 
             3. Semantic Relevance ({s_score:.2f} → {s_score**1.2:.2f}):
                 - Tertiary factor - lightest penalty
-            {element["semantic_relevance_reasoning"]}
+            {element["semantic_reasoning"]}
             """
             
             element["final_score"] = final_score
             element["final_reasoning"] = reasoning.strip()
         
-        # Find element with highest score
-        max_element = max(elements, key=lambda x: x["final_score"])
-        max_index = elements.index(max_element)
-        return max_element, max_index, max_element["final_reasoning"]
+        if isinstance(available_actions, str):
+            available_actions = available_actions.split("\n")
+        
+        # Sort elements by final score
+        sorted_elements = sorted(elements, key=lambda x: x["final_score"], reverse=True)
+        
+        # Find natural cutoff using a simpler method - look for first big drop
+        scores = [e["final_score"] for e in sorted_elements]
+        cutoff_idx = 1  # Always include at least the top element
+        
+        if len(scores) > 1:
+            # Look for first drop that's more than 30% of the max score
+            threshold = 0.3 * max(scores)
+            for i in range(len(scores) - 1):
+                if scores[i] - scores[i + 1] > threshold:
+                    cutoff_idx = i + 1
+                    break
+        
+        # Limit to top 5 in any case
+        cutoff_idx = min(cutoff_idx, 5)
+        
+        # Get top elements
+        filtered_elements = sorted_elements[:cutoff_idx]
+        
+        # Calculate confidence scores using softmax
+        top_scores = torch.tensor([e["final_score"] for e in filtered_elements])
+        confidence_scores = torch.nn.functional.softmax(top_scores, dim=0).tolist()
+        
+        # Add confidence scores and original indices to elements
+        for i, (element, conf_score) in enumerate(zip(filtered_elements, confidence_scores)):
+            element["confidence_score"] = conf_score
+            element["original_index"] = elements.index(element)
+        
+        # Keep the same detailed reasoning format
+        score_distribution = "\nConfidence Distribution:\n" + "\n".join(
+            f"- Element {e['original_index']} ({e['type']}): {e['final_score']:.2f} → {e['confidence_score']:.2f}" + 
+            (" (natural break point)" if i == cutoff_idx-1 else "")
+            for i, e in enumerate(filtered_elements)
+        )
+        
+        enhanced_rationale = f"""
+        {rationale}
+        
+        Element Filtering:
+        - Selected top {cutoff_idx} elements based on score distribution
+        - Score threshold for significant drop: {0.3 * max(scores):.3f}
+        {score_distribution}
+        
+        Note: Final scores converted to confidence scores using softmax
+        """
+
+        return filtered_elements, enhanced_rationale, confidence_scores

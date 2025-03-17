@@ -1,7 +1,7 @@
 import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, TypedDict
 import base64
 from io import BytesIO
 import asyncio
@@ -20,15 +20,15 @@ app = FastAPI(
 
 
 ui_ranker = UIRanker()
-async def get_next_element(screenshot_image, previous_screenshot_image, task, context, scratchpad, elements, prev_action, ui_ranker=ui_ranker):
+async def get_next_element(screenshot_image, previous_screenshot_image, goal, context, scratchpad, bboxes, available_actions, ui_ranker=ui_ranker):
     
     if scratchpad:
         scratchpad_str = '\n------------\n'.join([f'{action["content"]}' for i, action in enumerate(scratchpad)])
-        prompt = f"""You are a {context["age"]} years old {context["domain_familiarity"]} level {context["domain"]}, with {context["tech_savviness"]} tech savviness, navigating a UI to complete a specific task. 
+        prompt = f"""You are a {context.age} year old {context.domain_familiarity} level {context.title}, with {context.tech_savviness} tech savviness, navigating a UI to complete a specific task. 
 
 TASK OBJECTIVE:
 ```
-{task}
+{goal}
 ```
 
 INTERACTION HISTORY:
@@ -41,7 +41,7 @@ CURRENT SITUATION:
 Looking at the current screenshot and considering the interaction history:
 1. Does the current page still lead toward the task objective?
 2. Have we moved away from the logical path to complete the task?
-3. Would a typical {context["domain_familiarity"]} {context["domain"]} with {context["tech_savviness"]} tech savviness realize they need to backtrack?
+3. Would a typical {context.age} year old {context.domain_familiarity} level {context.title} with {context.tech_savviness} tech savviness realize they need to backtrack?
 
 DECISION NEEDED:
 Should we continue from this point or backtrack to a previous state?"""
@@ -63,30 +63,13 @@ Should we continue from this point or backtrack to a previous state?"""
         response = await chat_anthropic(prompt, screenshot_image, output_schema=BacktrackDecision)
     
         if response.backtrack and response.confidence > 0.5:
-            return None, "backtrack", response.reasoning
+            return ["backtrack to a previous state"], response.reasoning, response.confidence
     
-    last_action = prev_action.get("action", None)
-    last_element = prev_action.get("bounding", None)
+    rankings, rationale, confidence = await ui_ranker.rank_elements(screenshot_image, previous_screenshot_image, bboxes, goal, context, available_actions)
     
-    output_element, max_index, reasoning = await ui_ranker.rank_elements(screenshot_image, previous_screenshot_image, elements, task, context, last_element)
+    output_rankings = [RankedAction(action=element["semantic_action"], goal_alignment={"score": element["final_score"], "reasoning": element["final_reasoning"]}) for element in rankings]
     
-    if last_action == "hover":
-        if last_element["element_id"] == output_element["element_id"]:
-            action = "click"
-        else:
-            action = "hover"
-    elif last_action == "click":
-        if last_element["element_id"] == output_element["element_id"] and output_element["type"] == "textbox":
-            action = "type"
-        else:
-            action = "click"
-    else:
-        action = "click"
-        
-    print("reasoning: ", reasoning)
-    
-    print("output of ui_ranker.rank_elements:\n", json.dumps(output_element, indent=4))
-    return elements[max_index], action, reasoning
+    return output_rankings, rationale, confidence
 
 
 class Element(BaseModel):
@@ -97,16 +80,21 @@ class Element(BaseModel):
     text: str
     type: str
     selector: str
-    
+
+class UserContext(BaseModel):
+    age: int
+    title: str
+    domain_familiarity: str
+    tech_savviness: str
 
 class System2Request(BaseModel):
-    task: str
-    previous_screenshot: str | None = None
-    screenshot: str
-    context: Dict[str, Any]
+    goal: str
+    img: str
+    prev_img: str | None = None
     scratchpad: List[Dict[str, str]] = []
-    elements: List[Element] = []
-    prev_action: Dict[str, str | Element] = {}
+    bboxes: List[Element] = []
+    context: UserContext
+    available_actions: str
     
     def get_images(self) -> tuple[Image.Image, Image.Image | None]:
         """Convert both screenshots to PIL Image objects
@@ -141,12 +129,12 @@ class System2Request(BaseModel):
 
         try:
             # Always parse current screenshot
-            current_image = parse_single_image(self.screenshot)
+            current_image = parse_single_image(self.img)
             
             # Parse previous screenshot if provided
             previous_image = None
-            if self.previous_screenshot:
-                previous_image = parse_single_image(self.previous_screenshot)
+            if self.prev_img:
+                previous_image = parse_single_image(self.prev_img)
             
             return current_image, previous_image
             
@@ -159,10 +147,15 @@ class System2Request(BaseModel):
             )
 
 
-class System2Response(BaseModel):
-    selected_element: Element
+class RankedAction(TypedDict):
     action: str
-    reasoning: str
+    goal_alignment: Dict[str, Any]
+
+
+class System2Response(TypedDict):
+    rankings: List[RankedAction]
+    rationale: str
+    confidence: str
 
 
 @app.post("/s2", response_model=System2Response)
@@ -171,13 +164,13 @@ async def system2(request: System2Request):
         # Get the screenshots as PIL Image objects
         current_image, previous_image = request.get_images()
         
-        element, action, reasoning = await get_next_element(current_image, previous_image, request.task, request.context, request.scratchpad, request.elements, request.prev_action)
+        rankings, rationale, confidence = await get_next_element(current_image, previous_image, request.goal, request.context, request.scratchpad, request.bboxes, request.available_actions)
         
         # For now, return a placeholder response
         return System2Response(
-            selected_element=element,
-            action=action,
-            reasoning=reasoning
+            rankings=[{"action": action, "goal_alignment": goal_alignment} for action, goal_alignment in rankings],
+            rationale=rationale,
+            confidence=confidence
         )
         
     except HTTPException as http_exc:
